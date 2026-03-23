@@ -46,6 +46,12 @@ class AgentCell:
         self.decision_topic = f"agent.decisions.{cell_id}"
         self._decision_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS})
 
+        # Dashboard registry (set by orchestrator after creation)
+        self.dashboard_registry = None
+
+        # Wire nucleus decision logging to Kafka
+        self.nucleus.on_decision = self._log_decision
+
     async def propose(self) -> list[dict]:
         """Phase 1: Initialize the cell and ask the nucleus to propose consumers.
         Returns the proposed decisions for operator review without spawning anything."""
@@ -266,7 +272,7 @@ class AgentCell:
         )
 
     async def replace_consumer(self, action: dict) -> str:
-        """Hot-swap a consumer's code. Stops old, spawns new with updated code + metadata."""
+        """Hot-swap a consumer's code. Validates new code BEFORE stopping old consumer."""
         consumer_id = action["consumer_id"]
         old = self.consumer_manager.consumers.get(consumer_id)
         if old is None:
@@ -282,19 +288,38 @@ class AgentCell:
             knowledge_tables=action.get("knowledge_tables", old.spec.knowledge_tables),
         )
 
-        # Stop old consumer
+        # Validate new code compiles BEFORE touching the old consumer
+        from src.cell.consumer import _compile_consumer_code
+        try:
+            _compile_consumer_code(new_spec.consumer_code)
+        except Exception as e:
+            return f"New code failed to compile — old consumer kept running. Error: {e}"
+
+        # Stop old consumer and wait for the thread to actually finish
+        old.running = False  # signal the thread loop to exit
         self.consumer_manager.stop(consumer_id)
-        # Wait for task to actually finish
         if old.task:
-            try:
-                await asyncio.wait_for(old.task, timeout=5)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
+            # Wait longer — the thread needs time to exit poll() and close the Kafka consumer
+            for _ in range(20):  # up to 10 seconds
+                if old.task.done():
+                    break
+                await asyncio.sleep(0.5)
+            if not old.task.done():
+                print(f"  [{self.name}] Warning: old consumer thread still running after 10s")
+
+        # Carry forward event counters
+        prior_events = old.events_processed
+        prior_alerts = old.alerts_emitted
         del self.consumer_manager.consumers[consumer_id]
+
+        # Small delay to ensure Kafka consumer group is fully released
+        await asyncio.sleep(1)
 
         # Spawn new
         try:
-            self.consumer_manager.spawn(new_spec)
+            managed = self.consumer_manager.spawn(new_spec)
+            managed.events_processed = prior_events
+            managed.alerts_emitted = prior_alerts
             self._persist_consumers()
             self._log_decision({
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -305,7 +330,14 @@ class AgentCell:
             })
             return f"Consumer '{consumer_id}' replaced and running"
         except Exception as e:
-            return f"Failed to spawn updated consumer: {e}"
+            # Spawn failed after stopping old — try to restore the old consumer
+            try:
+                restored = self.consumer_manager.spawn(old.spec)
+                restored.events_processed = prior_events
+                restored.alerts_emitted = prior_alerts
+                return f"Failed to spawn new consumer ({e}) — restored old consumer"
+            except Exception as restore_err:
+                return f"Failed to spawn new consumer ({e}) AND failed to restore old ({restore_err}). Consumer '{consumer_id}' is gone."
 
     async def add_consumer(self, spec: ConsumerSpec) -> str:
         """Add a new consumer from a spec."""
@@ -338,6 +370,49 @@ class AgentCell:
         if tool_name == "get_consumer_code":
             code = self.consumer_manager.get_consumer_code(tool_input["consumer_id"])
             return code or f"Consumer '{tool_input['consumer_id']}' not found"
+        elif tool_name == "sample_topic":
+            from src.cell.kafka_tools import sample_topic
+            messages = await sample_topic(tool_input["topic"], tool_input.get("count", 5))
+            if not messages:
+                return f"No messages found in topic '{tool_input['topic']}' (topic may not exist or be empty)"
+            return json.dumps(messages, indent=2, default=str)
+        elif tool_name == "topic_stats":
+            from src.cell.kafka_tools import topic_stats
+            stats = await topic_stats(tool_input.get("topics"))
+            return json.dumps(stats, indent=2, default=str)
+        elif tool_name == "inspect_dlq":
+            consumer_id = tool_input.get("consumer_id")
+            limit = tool_input.get("limit", 10)
+            if consumer_id:
+                managed = self.consumer_manager.consumers.get(consumer_id)
+                if not managed:
+                    return f"Consumer '{consumer_id}' not found"
+                from src.cell.consumer import ConsumerManager as CM
+                entries = await CM.read_dlq(managed.dlq_topic, limit)
+                if not entries:
+                    return f"No errors in DLQ for '{consumer_id}' (errors count: {managed.errors})"
+                return json.dumps(entries, indent=2, default=str)
+            else:
+                summary = []
+                for m in self.consumer_manager.consumers.values():
+                    summary.append({
+                        "consumer_id": m.spec.consumer_id,
+                        "errors": m.errors,
+                        "dlq_topic": m.dlq_topic,
+                    })
+                return json.dumps(summary, indent=2)
+        elif tool_name == "create_dashboard":
+            if not self.dashboard_registry:
+                return "Dashboard server not available"
+            dashboard = self.dashboard_registry.create(
+                cell_id=self.cell_id,
+                cell_name=self.name,
+                title=tool_input.get("title", "Dashboard"),
+                description=tool_input.get("description", ""),
+                panels=tool_input.get("panels", []),
+            )
+            url = f"http://localhost:3000/dashboard/{dashboard.dashboard_id}"
+            return f"Dashboard created: {url} ({len(dashboard.panels)} panels)"
         return None
 
     # --- Decision & persistence ---

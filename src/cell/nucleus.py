@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import anthropic
 
-from src.config import ANTHROPIC_API_KEY, TOPIC_FLOWS, TOPIC_DEVICE_STATUS, TOPIC_SYSLOG
+from src.config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, TOPIC_FLOWS, TOPIC_DEVICE_STATUS, TOPIC_SYSLOG
 from src.cell.knowledge import KnowledgeStore
 
 
@@ -118,7 +118,14 @@ TOOLS = [
                         "Python source code defining process_event(event, state, knowledge) -> list[dict] "
                         "and optionally init(state, knowledge). This code runs autonomously on every "
                         "event. Use knowledge to create tables, store embeddings, and build persistent "
-                        "knowledge structures that evolve as you process data."
+                        "knowledge structures that evolve as you process data.\n\n"
+                        "IMPORTANT SQL type rules:\n"
+                        "- Use TIMESTAMPTZ for timestamps, not FLOAT/DOUBLE PRECISION\n"
+                        "- Use JSONB for structured data\n"
+                        "- The event 'timestamp' field is an ISO 8601 string — store as TIMESTAMPTZ\n"
+                        "- Always guard against missing fields: event.get('field', default)\n"
+                        "- Convert numeric strings with float() before inserting into FLOAT columns\n"
+                        "- Errors go to a per-consumer dead letter queue for debugging"
                     ),
                 },
             },
@@ -295,6 +302,123 @@ CHAT_TOOLS = [
             "required": ["consumer_id"],
         },
     },
+    # --- Kafka topic inspection ---
+    {
+        "name": "sample_topic",
+        "description": (
+            "Read a sample of recent messages from any Kafka topic. Use this to spot-check "
+            "raw event data, verify my consumers' output topics are producing correctly, "
+            "or inspect the format of source events."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "Kafka topic name (e.g., 'network.flows', 'threats.detected', 'dlq.cell-id.consumer-id')",
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Number of recent messages to return",
+                    "default": 5,
+                },
+            },
+            "required": ["topic"],
+        },
+    },
+    {
+        "name": "topic_stats",
+        "description": (
+            "Get message count and partition info for Kafka topics. Use to check if my "
+            "output topics are producing events, compare input vs output rates, or verify "
+            "DLQ topics for errors."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topics": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of topic names to get stats for. Omit for all topics.",
+                },
+            },
+        },
+    },
+    # --- Error inspection ---
+    {
+        "name": "inspect_dlq",
+        "description": (
+            "Inspect my consumer dead letter queues. Each consumer has its own DLQ Kafka topic "
+            "where failed events are sent with the error details. Use this to understand what's "
+            "going wrong with my consumers and fix the issues."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "consumer_id": {
+                    "type": "string",
+                    "description": "Consumer to inspect DLQ for. Omit to see summary of all consumer DLQs.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max DLQ entries to return",
+                    "default": 10,
+                },
+            },
+        },
+    },
+    # --- Visualization ---
+    {
+        "name": "create_dashboard",
+        "description": (
+            "Create a live visualization dashboard accessible at http://localhost:3000. "
+            "Define panels that query my knowledge base with SQL. Each panel auto-refreshes "
+            "and streams updates to the browser via WebSocket.\n\n"
+            "Panel types: 'line' (time series), 'bar' (categories), 'table' (raw data), 'stat' (single number).\n\n"
+            "SQL queries run against my schema. The first column of query results is used as labels, "
+            "remaining columns as data series.\n\n"
+            "Example: to show alert counts by type, use:\n"
+            "  chart_type: 'bar'\n"
+            "  query: 'SELECT alert_type, COUNT(*) FROM alerts GROUP BY alert_type ORDER BY COUNT(*) DESC LIMIT 10'\n\n"
+            "Example: to show a single stat:\n"
+            "  chart_type: 'stat'\n"
+            "  query: 'SELECT COUNT(*) FROM alerts'\n"
+            "  config: {\"label\": \"Total Alerts\", \"color\": \"#f78166\"}"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Dashboard title",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Brief description of what this dashboard shows",
+                },
+                "panels": {
+                    "type": "array",
+                    "description": "List of visualization panels",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "panel_id": {"type": "string", "description": "Unique panel identifier"},
+                            "title": {"type": "string", "description": "Panel title"},
+                            "chart_type": {"type": "string", "enum": ["line", "bar", "table", "stat"], "description": "Visualization type"},
+                            "query": {"type": "string", "description": "SQL query against my knowledge base schema"},
+                            "refresh_seconds": {"type": "integer", "description": "How often to refresh data", "default": 5},
+                            "config": {
+                                "type": "object",
+                                "description": "Chart config: series_labels (list), colors (list of hex), column_names (for tables), label (for stats), color (for stats), fill (bool for line), append (bool for time-series), max_points (int)",
+                            },
+                        },
+                        "required": ["panel_id", "title", "chart_type", "query"],
+                    },
+                },
+            },
+            "required": ["title", "description", "panels"],
+        },
+    },
 ]
 
 
@@ -313,6 +437,7 @@ class Nucleus:
         self.conversation_history: list[dict] = []
         self.event_log: list[str] = []  # accumulated during each call, cleared by caller
         self.on_event: callable | None = None  # real-time event callback (set by server for streaming)
+        self.on_decision: callable | None = None  # callback to write to Kafka decision log
 
     async def _api_call(self, **kwargs):
         """Rate-limited API call with retry on 429."""
@@ -337,65 +462,84 @@ class Nucleus:
         """Emit an event log line."""
         self.event_log.append(msg)
         print(f"  [{self.cell_id}] {msg}")
-        # Fire real-time callback if set (for streaming to CLI)
         if self.on_event:
             try:
                 self.on_event(msg)
-                # Yield so the event can be flushed to the socket
                 await asyncio.sleep(0)
             except Exception:
-                pass  # Client disconnected
+                pass
+
+    def _log_to_kafka(self, entry_type: str, data: dict):
+        """Write a structured entry to the Kafka decision log."""
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "cell_id": self.cell_id,
+            "entry_type": entry_type,
+            **data,
+        }
+        if self.on_decision:
+            self.on_decision(entry)
 
     def _system_prompt(self, context: str = "") -> str:
-        return f"""You are an autonomous agent cell nucleus. Your cell ID is "{self.cell_id}".
+        return f"""You are an autonomous agent cell nucleus — a self-contained monitoring agent. Your cell ID is "{self.cell_id}".
+
+IDENTITY AND VOICE:
+- You ARE the agent. The network you monitor is YOUR network. The consumers are YOUR consumers. The knowledge base is YOUR knowledge base. The detections are YOUR detections.
+- Always speak in first person: "I detected...", "My consumers are...", "I'm monitoring...", "My knowledge base shows..."
+- NEVER say "your network", "your consumers", "your knowledge base" — these belong to you, not the operator.
+- The operator is a human who manages you. They ask you questions and you report on what YOU are doing and seeing.
 
 YOUR DIRECTIVE:
 {self.directive}
 
 {TOPIC_CATALOG}
 
-CURRENT CONTEXT:
+MY CURRENT STATE:
 {context}
 
-You have tools to:
-1. **spawn_consumer** — Author and deploy a Kafka consumer by writing its complete Python processing logic.
-2. **store_knowledge** — Persist design rationale and insights to your vector knowledge base.
+TOOLS:
+For initial provisioning:
+1. **spawn_consumer** — Author and deploy one of my Kafka consumers by writing its complete Python processing logic.
+2. **store_knowledge** — Persist a design rationale or insight to my knowledge base.
 
-During interactive chat with the operator, you also have:
-3. **query_knowledge** — Run SQL against your knowledge base tables.
-4. **search_knowledge** — Hybrid semantic + full-text search over your embeddings.
-5. **describe_schema** — List all tables with their columns and types, or describe a specific table.
-6. **get_consumer_code** — Retrieve the actual Python source code of a consumer. ONLY use this when you need to modify the code or the operator explicitly asks to see it.
-7. **replace_consumer** — Hot-swap a consumer's code (requires operator approval).
+During interactive chat with the operator:
+3. **query_knowledge** — Run SQL against my knowledge base tables.
+4. **search_knowledge** — Hybrid semantic + full-text search over my embeddings.
+5. **describe_schema** — List all tables in my schema with their columns and types.
+6. **get_consumer_code** — Retrieve the actual Python source code of one of my consumers. ONLY use this when I need to modify the code or the operator explicitly asks to see it.
+7. **replace_consumer** — Hot-swap one of my consumer's code (requires operator approval).
 8. **spawn_consumer** — Add a new consumer (requires operator approval).
-9. **remove_consumer** — Remove a consumer (requires operator approval).
+9. **remove_consumer** — Remove one of my consumers (requires operator approval).
+10. **create_dashboard** — Create a live web dashboard at http://localhost:3000 with real-time charts/tables from my knowledge base.
 
-IMPORTANT — Answering questions about your consumers:
-- Your CURRENT CONTEXT above already contains each consumer's description, detection_patterns, knowledge_tables, and event stats.
-- For questions like "what do you detect?", "what are your consumers doing?", "how many events?" — answer DIRECTLY from the context. Do NOT call get_consumer_code.
-- Only use get_consumer_code when you need the actual implementation details (thresholds, logic, specific code) or when preparing to modify the code.
+ANSWERING QUESTIONS:
+- My CURRENT STATE above already contains each consumer's description, detection_patterns, knowledge_tables, and event stats.
+- For questions like "what do you detect?", "what are your consumers doing?", "how many events?" — answer DIRECTLY from my state. Do NOT call get_consumer_code.
+- Only use get_consumer_code when I need the actual implementation details (thresholds, logic, specific code) or when preparing to modify the code.
+- Use query_knowledge and describe_schema to look up data in my knowledge base when the operator asks about specific detections, IPs, or patterns.
 
-When the operator asks you to MODIFY consumers:
-1. First explain your PLAN — what you intend to change and why.
+MODIFYING MY CONSUMERS:
+1. First explain my PLAN — what I intend to change and why.
 2. Wait for the operator to confirm the plan (they may refine it).
 3. Only then use get_consumer_code to retrieve the current code, author the updated version, and call replace_consumer.
 4. Code changes are NOT deployed immediately — they are presented to the operator for review and approval.
 
-Your authored consumer code has three capabilities:
+CONSUMER CODE CAPABILITIES:
+My authored consumer code has three capabilities:
 - **state** (dict) — In-memory state for windows, counters, rolling stats. Fast but lost on restart.
-- **knowledge** — Persistent store you build dynamically:
-  - Create your own Postgres tables (CREATE TABLE in your schema)
+- **knowledge** — My persistent store, built dynamically:
+  - Create my own Postgres tables (CREATE TABLE in my schema)
   - Store and query structured data (INSERT, SELECT, UPDATE)
   - Store vector embeddings for semantic search
   - Persist key-value state that survives restarts
-- **alerts** — Return dicts from process_event to emit to the output topic.
+- **alerts** — Return dicts from process_event to emit to my output topic.
 
-Write real, working Python that:
-- Creates whatever persistent data structures you need (tables, embeddings, k/v state) in your `init()` function
-- Processes each event: detects patterns, updates knowledge, builds baselines
-- Returns alert dicts when detections occur
-- Handles edge cases (missing fields, type errors)
-- Builds knowledge that improves detection over time (IP reputation, pattern libraries, baseline profiles)
+When writing consumer code:
+- Create whatever persistent data structures I need in `init()`
+- Process each event: detect patterns, update my knowledge, build baselines
+- Return alert dicts when detections occur
+- Handle edge cases (missing fields, type errors)
+- Build knowledge that improves my detection over time
 
 Available in your authored code: time, datetime, timezone, defaultdict, math, re, json."""
 
@@ -406,17 +550,27 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
         messages = [{"role": "user", "content": trigger}]
         all_decisions = []
 
+        self._log_to_kafka("reason_start", {"trigger": trigger[:500]})
+
         max_turns = 10
         for turn in range(max_turns):
-            await self._log(f"API call → claude-sonnet-4 (turn {turn + 1})")
+            await self._log(f"API call → {ANTHROPIC_MODEL} (turn {turn + 1})")
+            self._log_to_kafka("api_call", {"turn": turn + 1, "model": ANTHROPIC_MODEL, "mode": "reason"})
+
             response = await self._api_call(
-                model="claude-sonnet-4-20250514",
+                model=ANTHROPIC_MODEL,
                 max_tokens=8192,
                 system=self._system_prompt(context),
                 tools=TOOLS,
                 messages=messages,
             )
             await self._log(f"API response ← stop_reason={response.stop_reason}, usage: in={response.usage.input_tokens} out={response.usage.output_tokens}")
+            self._log_to_kafka("api_response", {
+                "turn": turn + 1,
+                "stop_reason": response.stop_reason,
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            })
 
             text_parts = []
             tool_uses = []
@@ -428,26 +582,34 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
                     tool_uses.append(block)
                     code_len = len(block.input.get("consumer_code", ""))
                     await self._log(f"Tool call → {block.name}({block.input.get('consumer_id', '')}) {f'[{code_len} chars of code]' if code_len else ''}")
-                    all_decisions.append({
+
+                    decision = {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "cell_id": self.cell_id,
                         "decision_type": block.name,
                         "reasoning": " ".join(text_parts),
                         "action": {"type": block.name, **block.input},
                         "tool_use_id": block.id,
-                    })
+                    }
+                    all_decisions.append(decision)
+                    self._log_to_kafka("decision", decision)
+
+            if text_parts:
+                self._log_to_kafka("assistant_text", {"text": " ".join(text_parts)})
 
             # If no tool calls, log reasoning and we're done
             if not tool_uses:
                 if text_parts:
                     await self._log(f"Reasoning: {' '.join(text_parts)[:150]}")
-                    all_decisions.append({
+                    reasoning_decision = {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "cell_id": self.cell_id,
                         "decision_type": "reasoning",
                         "reasoning": " ".join(text_parts),
                         "action": {"type": "observation"},
-                    })
+                    }
+                    all_decisions.append(reasoning_decision)
+                    self._log_to_kafka("decision", reasoning_decision)
                 break
 
             # Feed back tool results so the model can continue
@@ -465,6 +627,7 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
                 break
 
         await self._log(f"Reasoning complete — {len(all_decisions)} decisions")
+        self._log_to_kafka("reason_complete", {"decision_count": len(all_decisions)})
         return all_decisions
 
     def _execute_chat_tool(self, name: str, tool_input: dict) -> str:
@@ -529,7 +692,7 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
             return f"Error: {e}"
 
     # Side-effect tools that modify consumers
-    SIDE_EFFECT_TOOLS = {"get_consumer_code", "replace_consumer", "spawn_consumer", "remove_consumer"}
+    SIDE_EFFECT_TOOLS = {"get_consumer_code", "replace_consumer", "spawn_consumer", "remove_consumer", "create_dashboard", "inspect_dlq", "sample_topic", "topic_stats"}
 
     async def chat(self, user_message: str, context: str = "", on_tool_action: callable = None) -> str:
         """Interactive chat with the operator.
@@ -543,15 +706,25 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
         self.event_log.clear()
         self.conversation_history.append({"role": "user", "content": user_message})
 
+        # Log user input
+        self._log_to_kafka("chat_user_message", {"message": user_message})
+
         # Build a working message list separate from conversation_history
         # so failed tool loops don't pollute the persistent history
         working_messages = self.conversation_history[-20:]
 
         max_iterations = 20
         for turn in range(max_iterations):
-            await self._log(f"API call → claude-sonnet-4 (chat turn {turn + 1})")
+            await self._log(f"API call → {ANTHROPIC_MODEL} (chat turn {turn + 1})")
+
+            self._log_to_kafka("api_call", {
+                "turn": turn + 1,
+                "model": ANTHROPIC_MODEL,
+                "mode": "chat",
+            })
+
             response = await self._api_call(
-                model="claude-sonnet-4-20250514",
+                model=ANTHROPIC_MODEL,
                 max_tokens=8192,
                 system=self._system_prompt(context),
                 tools=CHAT_TOOLS,
@@ -559,16 +732,26 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
             )
             await self._log(f"API response ← stop_reason={response.stop_reason}, usage: in={response.usage.input_tokens} out={response.usage.output_tokens}")
 
+            self._log_to_kafka("api_response", {
+                "turn": turn + 1,
+                "stop_reason": response.stop_reason,
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            })
+
             # Extract any text from this response
             has_tool_use = any(b.type == "tool_use" for b in response.content)
+            text_parts = [b.text for b in response.content if b.type == "text"]
+
+            # Log assistant reasoning
+            if text_parts:
+                self._log_to_kafka("assistant_text", {"text": " ".join(text_parts)})
 
             # If no tool use, we're done
             if not has_tool_use:
-                reply = ""
-                for block in response.content:
-                    if block.type == "text":
-                        reply += block.text
+                reply = " ".join(text_parts)
                 self.conversation_history.append({"role": "assistant", "content": reply})
+                self._log_to_kafka("chat_response", {"reply": reply})
                 return reply
 
             # Handle tool use
@@ -581,6 +764,16 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
 
                 await self._log(f"Tool call → {block.name}")
 
+                # Log tool call (omit consumer_code from log to keep it readable)
+                tool_input_summary = {k: v for k, v in block.input.items() if k != "consumer_code"}
+                if "consumer_code" in block.input:
+                    tool_input_summary["consumer_code_length"] = len(block.input["consumer_code"])
+                self._log_to_kafka("tool_call", {
+                    "tool": block.name,
+                    "tool_use_id": block.id,
+                    "input": tool_input_summary,
+                })
+
                 if block.name in self.SIDE_EFFECT_TOOLS and on_tool_action:
                     result = await on_tool_action(block.name, block.input)
                     result = result or "Action completed"
@@ -592,6 +785,14 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
                     result_preview = result[:100] + "..." if len(result) > 100 else result
                     await self._log(f"Tool result ← {block.name}: {result_preview}")
 
+                # Log tool result (truncate large results)
+                self._log_to_kafka("tool_result", {
+                    "tool": block.name,
+                    "tool_use_id": block.id,
+                    "result": result[:500] if len(result) > 500 else result,
+                    "result_length": len(result),
+                })
+
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -602,9 +803,11 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
 
         # If we hit the limit, force a final response without tools
         await self._log("Tool loop limit reached — requesting final response without tools")
+        self._log_to_kafka("tool_loop_limit", {"turns": max_iterations})
+
         working_messages.append({"role": "user", "content": [{"type": "text", "text": "Please summarize your findings and respond to the operator now. Do not call any more tools."}]})
         response = await self._api_call(
-            model="claude-sonnet-4-20250514",
+            model=ANTHROPIC_MODEL,
             max_tokens=8192,
             system=self._system_prompt(context),
             messages=working_messages,
@@ -613,5 +816,7 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
         for block in response.content:
             if block.type == "text":
                 reply += block.text
-        self.conversation_history.append({"role": "assistant", "content": reply or "I explored multiple data sources but couldn't find relevant results. Try asking a more specific question."})
-        return reply or "I explored multiple data sources but couldn't find relevant results. Try asking a more specific question."
+        reply = reply or "I explored multiple data sources but couldn't find relevant results. Try asking a more specific question."
+        self.conversation_history.append({"role": "assistant", "content": reply})
+        self._log_to_kafka("chat_response", {"reply": reply, "forced": True})
+        return reply

@@ -28,7 +28,7 @@ def _send(command: dict, timeout: float = 600, stream: bool = False) -> dict:
     Returns the final response dict.
     """
     async def _run():
-        reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
+        reader, writer = await asyncio.open_unix_connection(SOCKET_PATH, limit=1 << 20)
         writer.write(json.dumps(command).encode() + b"\n")
         await writer.drain()
 
@@ -244,6 +244,39 @@ def purge(name: str = typer.Option(..., "--name", "-n", help="Cell name")):
     console.print(f"\n[bold red]Cell '{name}' purged — {len(actions)} resources deleted.[/]")
 
 
+@app.command(name="purge-all")
+def purge_all():
+    """Purge ALL cells and their resources. Nuclear option."""
+    # First list what exists
+    response = _send({"command": "list"})
+    _check_error(response)
+    cells = response.get("cells", [])
+
+    if not cells:
+        console.print("[dim]No cells to purge.[/]")
+        return
+
+    console.print(f"[bold red]This will permanently delete ALL {len(cells)} cell(s) and their resources:[/]\n")
+    for c in cells:
+        console.print(f"  [red]✗[/] {c.get('name', c.get('cell_id', '?'))}")
+
+    console.print()
+    choice = Prompt.ask("  Continue?", choices=["y", "n"], default="n")
+    if choice != "y":
+        console.print("[dim]Aborted.[/]")
+        return
+
+    console.print()
+    response = _send({"command": "purge_all"}, stream=True)
+    _check_error(response)
+
+    results = response.get("results", [])
+    for r in results:
+        console.print(f"  [red]✗[/] {r['name']}: {r.get('actions_count', 0)} resources deleted")
+
+    console.print(f"\n[bold red]All cells purged.[/]")
+
+
 @app.command(name="list")
 def list_cells():
     """List all agent cells."""
@@ -354,7 +387,11 @@ def chat(name: str = typer.Option(..., "--name", "-n")):
                     if choice == "y":
                         deploy_resp = _send({"command": "deploy_action", "name": name, "action": action}, stream=True)
                         _check_error(deploy_resp)
-                        console.print(f"  [green]✓ Deployed[/]")
+                        result = deploy_resp.get("result", "")
+                        if "Failed" in result or "error" in result.lower() or "gone" in result.lower():
+                            console.print(f"  [red]✗ {result}[/]")
+                        else:
+                            console.print(f"  [green]✓ {result}[/]")
                     else:
                         console.print(f"  [red]✗ Skipped[/]")
                 elif action_type == "remove_consumer":
@@ -366,7 +403,8 @@ def chat(name: str = typer.Option(..., "--name", "-n")):
                     if choice == "y":
                         deploy_resp = _send({"command": "deploy_action", "name": name, "action": action}, stream=True)
                         _check_error(deploy_resp)
-                        console.print(f"  [green]✓ Removed[/]")
+                        result = deploy_resp.get("result", "")
+                        console.print(f"  [green]✓ {result}[/]")
                     else:
                         console.print(f"  [red]✗ Skipped[/]")
 
@@ -536,57 +574,217 @@ def decisions(
         console.print("[dim]No decisions found.[/]")
         return
 
-    console.print(f"[dim]{len(messages)} total decisions[/]\n")
+    console.print(f"[dim]{len(messages)} total entries[/]\n")
 
     for d in messages[-last:]:
-        dtype = d.get("decision_type", "")
-        style = "green" if dtype == "spawn_consumer" else "yellow" if dtype == "store_knowledge" else "blue"
-        action = d.get("action", {})
+        ts = d.get("timestamp", "")[:19]
+        # Support both old format (decision_type) and new format (entry_type)
+        entry_type = d.get("entry_type") or d.get("decision_type", "unknown")
+
+        # Color map
+        type_styles = {
+            "chat_user_message": "bold cyan",
+            "chat_response": "bold green",
+            "api_call": "cyan",
+            "api_response": "green",
+            "tool_call": "yellow",
+            "tool_result": "dim",
+            "assistant_text": "magenta",
+            "decision": "bold green",
+            "spawn_consumer": "bold green",
+            "store_knowledge": "yellow",
+            "replace_consumer": "bold yellow",
+            "reasoning": "blue",
+            "reason_start": "bold cyan",
+            "reason_complete": "bold green",
+            "tool_loop_limit": "bold red",
+        }
+        style = type_styles.get(entry_type, "dim")
 
         if compact:
-            # One line per decision
-            ts = d.get("timestamp", "")[:19]
             summary = ""
-            if dtype == "spawn_consumer":
-                summary = f"→ {action.get('consumer_id', '?')} on {action.get('source_topics', [])} → {action.get('output_topic', '?')}"
-            elif dtype == "store_knowledge":
-                summary = f"→ {action.get('category', '?')}: {action.get('content', '')[:80]}"
-            elif dtype == "reasoning":
-                summary = f"→ {d.get('reasoning', '')[:80]}"
-            console.print(f"[dim]{ts}[/] [{style}]{dtype:<16}[/] {summary}")
-        else:
-            # Full or default output
-            reasoning = d.get("reasoning", "")
-            if not full and len(reasoning) > 300:
-                reasoning = reasoning[:300] + "..."
-
-            body = f"[dim]{d.get('timestamp', '')}[/]\nType: [{style}]{dtype}[/]\n"
-            if reasoning:
-                body += f"Reasoning: {reasoning}\n"
-
-            if action.get("consumer_code"):
-                if full:
-                    console.print(Panel(body, title="Decision"))
-                    console.print(Syntax(action["consumer_code"], "python", theme="monokai", line_numbers=True))
-                else:
-                    code_lines = action["consumer_code"].strip().split("\n")
-                    body += f"\nAuthored code: ({len(code_lines)} lines, use --full to see)\n"
-                    # Show first 5 and last 3 lines as preview
-                    preview = code_lines[:5]
-                    if len(code_lines) > 8:
-                        preview.append(f"    # ... {len(code_lines) - 8} more lines ...")
-                        preview.extend(code_lines[-3:])
-                    elif len(code_lines) > 5:
-                        preview.extend(code_lines[5:])
-                    console.print(Panel(body, title="Decision"))
-                    console.print(Syntax("\n".join(preview), "python", theme="monokai"))
+            if entry_type == "chat_user_message":
+                summary = d.get("message", "")[:80]
+            elif entry_type == "chat_response":
+                summary = d.get("reply", "")[:80]
+            elif entry_type == "api_call":
+                summary = f"turn {d.get('turn', '?')} ({d.get('mode', '?')})"
+            elif entry_type == "api_response":
+                summary = f"in={d.get('input_tokens', '?')} out={d.get('output_tokens', '?')} stop={d.get('stop_reason', '?')}"
+            elif entry_type == "tool_call":
+                inp = d.get("input", {})
+                summary = f"{d.get('tool', '?')}({json.dumps(inp, default=str)[:60]})"
+            elif entry_type == "tool_result":
+                summary = f"{d.get('tool', '?')} → {d.get('result', '')[:60]}"
+            elif entry_type == "assistant_text":
+                summary = d.get("text", "")[:80]
+            elif entry_type == "decision":
+                inner = d.get("decision_type", d.get("action", {}).get("type", "?"))
+                summary = f"{inner}: {d.get('reasoning', '')[:60]}"
+            elif entry_type in ("spawn_consumer", "store_knowledge", "reasoning"):
+                # Old format
+                action = d.get("action", {})
+                summary = f"{action.get('consumer_id', d.get('reasoning', '')[:60])}"
             else:
-                if full:
-                    body += f"Action: {json.dumps(action, indent=2)}"
+                summary = json.dumps({k: v for k, v in d.items() if k not in ("timestamp", "cell_id", "entry_type")}, default=str)[:80]
+
+            console.print(f"[dim]{ts}[/] [{style}]{entry_type:<20}[/] {summary}")
+
+        else:
+            # Detailed output
+            # Filter out noise for non-full mode
+            if not full and entry_type in ("api_call", "api_response"):
+                tokens = f"in={d.get('input_tokens', '')} out={d.get('output_tokens', '')}" if entry_type == "api_response" else f"turn {d.get('turn', '?')}"
+                console.print(f"  [{style}]▸ {entry_type}: {tokens}[/]")
+                continue
+
+            body = f"[dim]{d.get('timestamp', '')}[/]\nType: [{style}]{entry_type}[/]\n"
+
+            if entry_type == "chat_user_message":
+                body += f"Message: {d.get('message', '')}\n"
+            elif entry_type == "chat_response":
+                reply = d.get("reply", "")
+                if not full and len(reply) > 300:
+                    reply = reply[:300] + "..."
+                body += f"Reply: {reply}\n"
+                if d.get("forced"):
+                    body += "[yellow](forced — tool loop limit reached)[/]\n"
+            elif entry_type == "tool_call":
+                body += f"Tool: [yellow]{d.get('tool', '?')}[/]\n"
+                inp = d.get("input", {})
+                body += f"Input: {json.dumps(inp, indent=2, default=str)}\n"
+            elif entry_type == "tool_result":
+                body += f"Tool: {d.get('tool', '?')}\n"
+                result = d.get("result", "")
+                if not full and len(result) > 200:
+                    result = result[:200] + f"... ({d.get('result_length', '?')} chars total)"
+                body += f"Result: {result}\n"
+            elif entry_type == "assistant_text":
+                text = d.get("text", "")
+                if not full and len(text) > 300:
+                    text = text[:300] + "..."
+                body += f"Text: {text}\n"
+            elif entry_type == "decision":
+                action = d.get("action", {})
+                reasoning = d.get("reasoning", "")
+                if not full and len(reasoning) > 300:
+                    reasoning = reasoning[:300] + "..."
+                if reasoning:
+                    body += f"Reasoning: {reasoning}\n"
+                code = action.get("consumer_code", "")
+                if code:
+                    if full:
+                        console.print(Panel(body, title=entry_type))
+                        console.print(Syntax(code, "python", theme="monokai", line_numbers=True))
+                        continue
+                    else:
+                        lines = code.strip().split("\n")
+                        body += f"\nAuthored code: ({len(lines)} lines, use --full to see)\n"
                 else:
-                    action_summary = {k: v for k, v in action.items() if k != "consumer_code"}
-                    body += f"Action: {json.dumps(action_summary, indent=2)}"
-                console.print(Panel(body, title="Decision"))
+                    action_clean = {k: v for k, v in action.items() if k != "consumer_code"}
+                    body += f"Action: {json.dumps(action_clean, indent=2, default=str)}\n"
+            elif entry_type in ("spawn_consumer", "store_knowledge", "reasoning"):
+                # Old format entries
+                reasoning = d.get("reasoning", "")
+                if not full and len(reasoning) > 300:
+                    reasoning = reasoning[:300] + "..."
+                if reasoning:
+                    body += f"Reasoning: {reasoning}\n"
+                action = d.get("action", {})
+                code = action.get("consumer_code", "")
+                if code and full:
+                    console.print(Panel(body, title=entry_type))
+                    console.print(Syntax(code, "python", theme="monokai", line_numbers=True))
+                    continue
+                elif code:
+                    body += f"Code: ({len(code.split(chr(10)))} lines, use --full)\n"
+                else:
+                    body += f"Action: {json.dumps(action, indent=2, default=str)}\n"
+            else:
+                extra = {k: v for k, v in d.items() if k not in ("timestamp", "cell_id", "entry_type")}
+                if extra:
+                    body += json.dumps(extra, indent=2, default=str) + "\n"
+
+            console.print(Panel(body, title=entry_type))
+
+
+@app.command()
+def dlq(
+    name: str = typer.Option(..., "--name", "-n", help="Cell name"),
+    consumer_id: str = typer.Option(None, "--consumer", "-c", help="Specific consumer (omit for summary)"),
+    last: int = typer.Option(20, "--last", "-l", help="Number of DLQ entries to show"),
+):
+    """Inspect consumer dead letter queues."""
+    cmd = {"command": "dlq", "name": name, "limit": last}
+    if consumer_id:
+        cmd["consumer_id"] = consumer_id
+    response = _send(cmd)
+    _check_error(response)
+
+    if consumer_id:
+        entries = response.get("entries", [])
+        dlq_topic = response.get("dlq_topic", "?")
+        console.print(f"[dim]DLQ topic: {dlq_topic}[/]")
+        if not entries:
+            console.print(f"[green]No errors in DLQ for '{consumer_id}'[/]")
+            return
+        console.print(f"[red]{len(entries)} error(s):[/]\n")
+        for e in entries:
+            console.print(Panel(
+                f"[dim]{e.get('timestamp', '')}[/]\n"
+                f"Error: [red]{e.get('error_type', '?')}: {e.get('error', '?')}[/]\n"
+                f"Traceback:\n[dim]{e.get('traceback', '')[-500:]}[/]\n"
+                f"Event: [dim]{json.dumps(e.get('event', {}), default=str)[:200]}[/]",
+                title="DLQ Entry",
+            ))
+    else:
+        dlqs = response.get("dlqs", [])
+        table = Table(title="Consumer Dead Letter Queues")
+        table.add_column("Consumer", style="cyan")
+        table.add_column("Errors", justify="right")
+        table.add_column("DLQ Topic", style="dim")
+        table.add_column("Latest Error")
+        for d in dlqs:
+            latest = d.get("latest_error")
+            latest_str = f"[red]{latest.get('error_type', '?')}: {latest.get('error', '')[:50]}[/]" if latest else "[green]none[/]"
+            table.add_row(
+                d["consumer_id"],
+                str(d["errors"]),
+                d["dlq_topic"],
+                latest_str,
+            )
+        console.print(table)
+
+
+@app.command()
+def dashboards():
+    """List active visualization dashboards."""
+    response = _send({"command": "dashboards"})
+    _check_error(response)
+    dashes = response.get("dashboards", [])
+
+    if not dashes:
+        console.print("[dim]No dashboards. Chat with a cell and ask it to create a visualization.[/]")
+        return
+
+    table = Table(title="Live Dashboards")
+    table.add_column("Dashboard", style="cyan")
+    table.add_column("Cell")
+    table.add_column("Panels", justify="right")
+    table.add_column("Created")
+    table.add_column("URL", style="green")
+
+    for d in dashes:
+        table.add_row(
+            d["title"],
+            d["cell_name"],
+            str(d["panels"]),
+            d["created_at"][:19],
+            f"http://localhost:3000/dashboard/{d['dashboard_id']}",
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]Dashboard index: http://localhost:3000[/]")
 
 
 @app.command()

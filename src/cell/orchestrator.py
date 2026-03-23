@@ -12,24 +12,23 @@ from src.cell.agent_cell import AgentCell, CellStatus
 class CellOrchestrator:
     """Manages agent cell lifecycle: create, start, pause, resume, destroy, reload."""
 
-    def __init__(self):
+    def __init__(self, dashboard_registry=None):
         self.cells: dict[str, AgentCell] = {}
+        self.dashboard_registry = dashboard_registry
+
+    def create_cell(self, name: str, directive: str) -> AgentCell:
+        """Create a cell and register it, but don't start reasoning yet.
+        This allows the caller to wire event callbacks before propose()."""
+        cell_id = f"{name}-{uuid.uuid4().hex[:8]}"
+        cell = AgentCell(cell_id=cell_id, name=name, directive=directive)
+        cell.dashboard_registry = self.dashboard_registry
+        self.cells[name] = cell
+        return cell
 
     async def add_cell(self, name: str, directive: str) -> AgentCell:
         """Create and start a new agent cell (auto-approve, no review)."""
-        cell_id = f"{name}-{uuid.uuid4().hex[:8]}"
-        cell = AgentCell(cell_id=cell_id, name=name, directive=directive)
-        self.cells[name] = cell
+        cell = self.create_cell(name, directive)
         await cell.start()
-        return cell
-
-    async def propose_cell(self, name: str, directive: str) -> AgentCell:
-        """Create a cell and propose consumers for operator review."""
-        cell_id = f"{name}-{uuid.uuid4().hex[:8]}"
-        cell = AgentCell(cell_id=cell_id, name=name, directive=directive)
-        self.cells[name] = cell
-        decisions = await cell.propose()
-        cell._pending_decisions = decisions  # stash for approve/reject
         return cell
 
     async def remove_cell(self, name: str):
@@ -114,11 +113,37 @@ class CellOrchestrator:
                 continue
 
             cell = AgentCell(cell_id=cell_id, name=name, directive=directive)
+            cell.dashboard_registry = self.dashboard_registry
             self.cells[name] = cell
             await cell.reload()
             reloaded += 1
 
         return reloaded
+
+    async def purge_all_cells(self) -> list[dict]:
+        """Purge all cells — in-memory and DB-only."""
+        results = []
+
+        # Purge in-memory cells
+        for name in list(self.cells.keys()):
+            try:
+                actions = await self.purge_cell(name)
+                results.append({"name": name, "actions": actions, "actions_count": len(actions)})
+            except Exception as e:
+                results.append({"name": name, "error": str(e), "actions_count": 0})
+
+        # Purge any remaining DB-only cells
+        with psycopg.connect(POSTGRES_URL) as conn:
+            rows = conn.execute("SELECT cell_id, name, directive FROM public.cells").fetchall()
+        for cell_id, name, directive in rows:
+            try:
+                cell = AgentCell(cell_id=cell_id, name=name, directive=directive)
+                actions = await cell.purge()
+                results.append({"name": name, "actions": actions, "actions_count": len(actions)})
+            except Exception as e:
+                results.append({"name": name, "error": str(e), "actions_count": 0})
+
+        return results
 
     async def pause_cell(self, name: str):
         cell = self.get_cell(name)
