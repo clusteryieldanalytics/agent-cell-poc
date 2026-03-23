@@ -45,6 +45,7 @@ class ManagedConsumer:
     alerts_emitted: int = 0
     last_event_time: float = 0
     errors: int = 0
+    dlq_topic: str = ""
     running: bool = False
 
     def to_dict(self, include_code: bool = False) -> dict:
@@ -58,6 +59,7 @@ class ManagedConsumer:
             "events_processed": self.events_processed,
             "alerts_emitted": self.alerts_emitted,
             "errors": self.errors,
+            "dlq_topic": self.dlq_topic,
             "running": self.running,
         }
         if include_code:
@@ -175,6 +177,7 @@ class ConsumerManager:
         self.cell_name = cell_name
         self.knowledge_store = knowledge_store
         self.consumers: dict[str, ManagedConsumer] = {}
+        self._generation: int = 0  # incremented on each spawn to avoid consumer group conflicts
 
     def spawn(self, spec: ConsumerSpec) -> ManagedConsumer:
         """Compile the authored code and spawn the consumer as an asyncio task."""
@@ -184,7 +187,9 @@ class ConsumerManager:
         state = {}
         init_fn(state, knowledge)
 
+        self._generation += 1
         managed = ManagedConsumer(spec=spec, running=True)
+        managed.dlq_topic = f"dlq.{self.cell_id}.{spec.consumer_id}"
         managed.task = asyncio.create_task(
             self._run_consumer(managed, process_event, state, knowledge)
         )
@@ -208,7 +213,7 @@ class ConsumerManager:
         def _blocking_consumer_loop():
             consumer = Consumer({
                 "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
-                "group.id": f"cell-{self.cell_id}-{managed.spec.consumer_id}",
+                "group.id": f"cell-{self.cell_id}-{managed.spec.consumer_id}-gen{self._generation}",
                 "auto.offset.reset": "latest",
                 "enable.auto.commit": True,
             })
@@ -250,10 +255,29 @@ class ConsumerManager:
                                 )
                                 managed.alerts_emitted += 1
                             producer.poll(0)
-                    except Exception:
+                    except Exception as e:
                         managed.errors += 1
+                        # Write to DLQ
+                        dlq_entry = {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "cell_id": self.cell_id,
+                            "consumer_id": managed.spec.consumer_id,
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                            "traceback": traceback.format_exc(),
+                            "event": event,
+                        }
+                        try:
+                            producer.produce(
+                                managed.dlq_topic,
+                                key=self.cell_id.encode(),
+                                value=json.dumps(dlq_entry, default=str).encode(),
+                            )
+                            producer.poll(0)
+                        except Exception:
+                            pass
                         if managed.errors <= 5:
-                            traceback.print_exc()
+                            print(f"  [{self.cell_id}] Consumer '{managed.spec.consumer_id}' error → DLQ: {e}")
             finally:
                 consumer.close()
                 producer.flush(5)
@@ -285,3 +309,49 @@ class ConsumerManager:
 
     def total_events(self) -> int:
         return sum(m.events_processed for m in self.consumers.values())
+
+    @staticmethod
+    async def read_dlq(dlq_topic: str, limit: int = 20) -> list[dict]:
+        """Read recent entries from a consumer's DLQ topic. Runs in thread to avoid blocking."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, ConsumerManager._read_dlq_sync, dlq_topic, limit)
+
+    @staticmethod
+    def _read_dlq_sync(dlq_topic: str, limit: int) -> list[dict]:
+        from confluent_kafka import Consumer as KConsumer, TopicPartition
+
+        consumer = KConsumer({
+            "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
+            "group.id": "dlq-reader-ephemeral",
+            "auto.offset.reset": "earliest",
+            "enable.auto.commit": False,
+        })
+
+        metadata = consumer.list_topics(dlq_topic, timeout=5)
+        if dlq_topic not in metadata.topics:
+            consumer.close()
+            return []
+
+        partitions = [
+            TopicPartition(dlq_topic, p, 0)
+            for p in metadata.topics[dlq_topic].partitions.keys()
+        ]
+        consumer.assign(partitions)
+
+        messages = []
+        empty_polls = 0
+        while empty_polls < 2:  # 2 empty polls = ~1 second wait
+            msg = consumer.poll(0.5)
+            if msg is None:
+                empty_polls += 1
+                continue
+            if msg.error():
+                continue
+            empty_polls = 0
+            try:
+                messages.append(json.loads(msg.value()))
+            except Exception:
+                pass
+
+        consumer.close()
+        return messages[-limit:]

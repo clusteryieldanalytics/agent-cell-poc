@@ -20,6 +20,8 @@ import traceback
 from datetime import datetime, timezone
 
 from src.cell.orchestrator import CellOrchestrator
+from src.viz.dashboard import DashboardRegistry
+from src.viz.server import VizServer
 
 SOCKET_PATH = "/tmp/agentcell.sock"
 
@@ -30,9 +32,21 @@ class CellServer:
     """Async server that manages cells and accepts CLI commands."""
 
     def __init__(self):
-        self.orchestrator = CellOrchestrator()
+        self.dashboard_registry = DashboardRegistry()
+        self.orchestrator = CellOrchestrator(dashboard_registry=self.dashboard_registry)
+        self.viz_server = VizServer(
+            registry=self.dashboard_registry,
+            get_knowledge_store=self._get_knowledge_store,
+        )
         self._server = None
         self._started_at = datetime.now(timezone.utc)
+
+    def _get_knowledge_store(self, cell_id: str):
+        """Look up a cell's knowledge store by cell_id."""
+        for cell in self.orchestrator.cells.values():
+            if cell.cell_id == cell_id:
+                return cell.knowledge
+        return None
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle a single CLI command using streaming newline-delimited JSON."""
@@ -79,14 +93,26 @@ class CellServer:
 
     async def _dispatch(self, command: str, request: dict, send_event) -> dict:
         if command == "add":
-            cell = await self.orchestrator.add_cell(request["name"], request["directive"])
-            await self._flush_nucleus_events(cell, send_event)
+            # Create cell, wire streaming, reason, auto-approve
+            cell = self.orchestrator.create_cell(request["name"], request["directive"])
+            cell.nucleus.on_event = lambda msg: asyncio.ensure_future(send_event({"event": msg}))
+            try:
+                decisions = await cell.propose()
+                await cell.approve(decisions)
+            finally:
+                cell.nucleus.on_event = None
             return {"ok": True, "cell": cell.inspect()}
 
         elif command == "propose":
-            cell = await self.orchestrator.propose_cell(request["name"], request["directive"])
-            await self._flush_nucleus_events(cell, send_event)
-            return {"ok": True, "cell_id": cell.cell_id, "name": cell.name, "decisions": cell._pending_decisions}
+            # Create cell, wire streaming, reason, return decisions for review
+            cell = self.orchestrator.create_cell(request["name"], request["directive"])
+            cell.nucleus.on_event = lambda msg: asyncio.ensure_future(send_event({"event": msg}))
+            try:
+                decisions = await cell.propose()
+                cell._pending_decisions = decisions
+            finally:
+                cell.nucleus.on_event = None
+            return {"ok": True, "cell_id": cell.cell_id, "name": cell.name, "decisions": decisions}
 
         elif command == "approve":
             cell = self.orchestrator.get_cell(request["name"])
@@ -154,7 +180,11 @@ class CellServer:
 
         elif command == "deploy_action":
             cell = self.orchestrator.get_cell(request["name"])
-            result = await cell.deploy_action(request["action"])
+            action = request["action"]
+            log.info(f"Deploying {action.get('type')} for consumer '{action.get('consumer_id')}' (code: {len(action.get('consumer_code', ''))} chars)")
+            result = await cell.deploy_action(action)
+            log.info(f"Deploy result: {result}")
+            await send_event({"event": f"Deploy: {result}"})
             return {"ok": True, "result": result}
 
         elif command == "decisions":
@@ -173,6 +203,40 @@ class CellServer:
                 consumers = cell.consumer_manager.list_consumers(include_code=True)
                 return {"ok": True, "consumers": consumers}
 
+        elif command == "purge_all":
+            results = await self.orchestrator.purge_all_cells()
+            for r in results:
+                await send_event({"event": f"Purged {r['name']}: {r.get('actions_count', 0)} resources"})
+            return {"ok": True, "results": results}
+
+        elif command == "dlq":
+            cell = self.orchestrator.get_cell(request["name"])
+            consumer_id = request.get("consumer_id")
+            limit = request.get("limit", 20)
+            if consumer_id:
+                managed = cell.consumer_manager.consumers.get(consumer_id)
+                if not managed:
+                    return {"error": f"Consumer '{consumer_id}' not found"}
+                from src.cell.consumer import ConsumerManager
+                entries = await ConsumerManager.read_dlq(managed.dlq_topic, limit)
+                return {"ok": True, "consumer_id": consumer_id, "dlq_topic": managed.dlq_topic, "entries": entries}
+            else:
+                # Return DLQ summary for all consumers
+                dlqs = []
+                for managed in cell.consumer_manager.consumers.values():
+                    from src.cell.consumer import ConsumerManager
+                    entries = await ConsumerManager.read_dlq(managed.dlq_topic, limit=1)
+                    dlqs.append({
+                        "consumer_id": managed.spec.consumer_id,
+                        "dlq_topic": managed.dlq_topic,
+                        "errors": managed.errors,
+                        "latest_error": entries[-1] if entries else None,
+                    })
+                return {"ok": True, "dlqs": dlqs}
+
+        elif command == "dashboards":
+            return {"ok": True, "dashboards": self.dashboard_registry.list_all()}
+
         elif command == "status":
             cells = self.orchestrator.list_cells()
             return {
@@ -189,12 +253,6 @@ class CellServer:
 
         else:
             return {"error": f"Unknown command: {command}"}
-
-    async def _flush_nucleus_events(self, cell, send_event):
-        """Send any accumulated nucleus events to the client."""
-        for msg in cell.nucleus.event_log:
-            await send_event({"event": msg})
-        cell.nucleus.event_log.clear()
 
     async def start(self):
         """Start the server."""
@@ -216,6 +274,9 @@ class CellServer:
         except Exception as e:
             log.warning(f"Could not preload embedding model: {e}")
 
+        # Start visualization server
+        await self.viz_server.start()
+
         # Reload persisted cells
         try:
             reloaded = await self.orchestrator.reload_cells()
@@ -225,7 +286,8 @@ class CellServer:
             log.warning(f"Could not reload cells: {e}")
 
         self._server = await asyncio.start_unix_server(
-            self.handle_client, path=SOCKET_PATH
+            self.handle_client, path=SOCKET_PATH,
+            limit=1 << 20,  # 1MB readline buffer
         )
 
         log.info(f"Listening on {SOCKET_PATH}")
@@ -233,13 +295,13 @@ class CellServer:
 ╔══════════════════════════════════════════════════╗
 ║          Agent Cell Server Running               ║
 ║                                                  ║
-║  Socket: {SOCKET_PATH:<39s}║
+║  Socket:     {SOCKET_PATH:<34s}                      ║
+║  Dashboards: http://localhost:3000               ║
+║  Kafka UI:   http://localhost:8080               ║
 ║                                                  ║
 ║  Commands (in another terminal):                 ║
 ║    agentcell add -n <name> -d "<directive>"      ║
-║    agentcell list                                ║
-║    agentcell inspect -n <name>                   ║
-║    agentcell chat -n <name>                      ║
+║    agentcell list / inspect / chat / dashboards  ║
 ║                                                  ║
 ║  Press Ctrl+C to stop                            ║
 ╚══════════════════════════════════════════════════╝
@@ -268,6 +330,8 @@ class CellServer:
                 await cell.stop()
             except Exception as e:
                 log.error(f"Error stopping '{name}': {e}")
+
+        await self.viz_server.stop()
 
         if self._server:
             self._server.close()

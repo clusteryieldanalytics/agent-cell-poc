@@ -8,7 +8,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 POSTGRES_URL = os.getenv("POSTGRES_URL", "postgresql://agentcell:agentcell@localhost:5432/agentcell")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "voyage-3")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 
 # Kafka source topics
 TOPIC_FLOWS = "network.flows"
