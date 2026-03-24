@@ -187,6 +187,9 @@ class ConsumerManager:
         state = {}
         init_fn(state, knowledge)
 
+        # Ensure output and DLQ topics exist before consumer starts
+        self._ensure_topics(spec.output_topic, f"dlq.{self.cell_id}.{spec.consumer_id}")
+
         self._generation += 1
         managed = ManagedConsumer(spec=spec, running=True)
         managed.dlq_topic = f"dlq.{self.cell_id}.{spec.consumer_id}"
@@ -289,6 +292,23 @@ class ConsumerManager:
         except asyncio.CancelledError:
             managed.running = False
 
+    @staticmethod
+    def _ensure_topics(*topics: str):
+        """Create Kafka topics if they don't exist."""
+        from confluent_kafka.admin import AdminClient, NewTopic
+        admin = AdminClient({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS})
+        existing = set(admin.list_topics(timeout=5).topics.keys())
+        to_create = [NewTopic(t, num_partitions=1, replication_factor=1) for t in topics if t and t not in existing]
+        if to_create:
+            futures = admin.create_topics(to_create)
+            for topic, future in futures.items():
+                try:
+                    future.result()
+                    print(f"  Created topic: {topic}")
+                except Exception as e:
+                    if "TOPIC_ALREADY_EXISTS" not in str(e):
+                        print(f"  Warning: could not create topic {topic}: {e}")
+
     def stop(self, consumer_id: str):
         if consumer_id in self.consumers:
             managed = self.consumers[consumer_id]
@@ -340,7 +360,9 @@ class ConsumerManager:
 
         messages = []
         empty_polls = 0
-        while empty_polls < 2:  # 2 empty polls = ~1 second wait
+        max_read = limit * 5  # read at most 5x the limit to avoid infinite loop
+        reads = 0
+        while empty_polls < 2 and reads < max_read:
             msg = consumer.poll(0.5)
             if msg is None:
                 empty_polls += 1
@@ -348,6 +370,7 @@ class ConsumerManager:
             if msg.error():
                 continue
             empty_polls = 0
+            reads += 1
             try:
                 messages.append(json.loads(msg.value()))
             except Exception:

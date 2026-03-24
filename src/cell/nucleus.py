@@ -46,11 +46,21 @@ TOOLS = [
             "    knowledge.execute(sql, params=())    — INSERT/UPDATE/DELETE against your tables\n"
             "    knowledge.query(sql, params=())      — SELECT from your tables, returns list[tuple]\n"
             "    knowledge.store_embedding(content, category, metadata=None)\n"
-            "                                        — Store text with vector embedding (384-dim, auto-chunked) for semantic search\n"
-            "    knowledge.search(query, limit=5)     — Pure semantic (vector) search over stored embeddings\n"
+            "                                        — Embed text using sentence-transformers (all-MiniLM-L6-v2, 384-dim)\n"
+            "                                          and store in pgvector with HNSW index. Auto-chunks long text.\n"
+            "                                          Use for: attack pattern signatures, anomaly descriptions,\n"
+            "                                          device profiles, incident summaries — anything you want to\n"
+            "                                          retrieve later by semantic similarity.\n"
+            "                                          Categories: 'attack_pattern', 'ip_reputation', 'baseline',\n"
+            "                                          'device_profile', 'anomaly_rule', 'observation'\n"
+            "    knowledge.search(query, limit=5)     — Semantic similarity search over stored embeddings.\n"
+            "                                          Finds entries with similar MEANING, not just keyword match.\n"
+            "                                          e.g., search('lateral movement') finds 'cross-VLAN SSH attempts'\n"
             "    knowledge.hybrid_search(query, limit=5, keyword=None)\n"
-            "                                        — Hybrid search: vector + full-text merged via Reciprocal Rank Fusion\n"
-            "    knowledge.fts_search(query, limit=5)  — Full-text keyword search over stored knowledge\n"
+            "                                        — Best of both: vector similarity + full-text keyword search\n"
+            "                                          merged via Reciprocal Rank Fusion. Use keyword param for\n"
+            "                                          exact matches (IPs, device names) combined with semantic.\n"
+            "    knowledge.fts_search(query, limit=5)  — Pure keyword search over stored knowledge text\n"
             "    knowledge.get(key) -> dict|None      — Get persistent key-value entry\n"
             "    knowledge.set(key, value_dict)       — Set persistent key-value entry\n\n"
             "Available in scope: time, datetime, timezone, defaultdict, math, re, json.\n\n"
@@ -439,24 +449,70 @@ class Nucleus:
         self.on_event: callable | None = None  # real-time event callback (set by server for streaming)
         self.on_decision: callable | None = None  # callback to write to Kafka decision log
 
-    async def _api_call(self, **kwargs):
-        """Rate-limited API call with retry on 429."""
-        # Throttle
+    async def _throttle(self):
+        """Rate-limit API calls."""
         now = asyncio.get_event_loop().time()
         wait = Nucleus._min_interval - (now - Nucleus._last_api_call)
         if wait > 0:
             await asyncio.sleep(wait)
         Nucleus._last_api_call = asyncio.get_event_loop().time()
 
-        # Retry with backoff on rate limit
+    async def _api_call(self, **kwargs):
+        """Rate-limited API call with retry on 429. Non-streaming."""
+        await self._throttle()
         for attempt in range(5):
             try:
                 return await self.client.messages.create(**kwargs)
-            except anthropic.RateLimitError as e:
-                retry_after = min(2 ** attempt * 2, 30)  # 2, 4, 8, 16, 30
+            except anthropic.RateLimitError:
+                retry_after = min(2 ** attempt * 2, 30)
                 await self._log(f"Rate limited (429) — retrying in {retry_after}s (attempt {attempt + 1}/5)")
                 await asyncio.sleep(retry_after)
         raise anthropic.RateLimitError("Rate limited after 5 retries")
+
+    async def _api_call_stream(self, **kwargs):
+        """Rate-limited streaming API call. Emits text deltas in real-time.
+
+        Returns the final Message object (same as non-streaming).
+        Streams text_delta events to the CLI as the model thinks.
+        """
+        await self._throttle()
+
+        for attempt in range(5):
+            try:
+                async with self.client.messages.stream(**kwargs) as stream:
+                    # Stream text deltas as they arrive
+                    current_text_block = False
+                    async for event in stream:
+                        if event.type == "content_block_start":
+                            if event.content_block.type == "text":
+                                current_text_block = True
+                                self._emit_delta("\n")
+                            elif event.content_block.type == "tool_use":
+                                current_text_block = False
+                        elif event.type == "content_block_delta":
+                            if hasattr(event.delta, "text") and current_text_block:
+                                self._emit_delta(event.delta.text)
+                        elif event.type == "content_block_stop":
+                            if current_text_block:
+                                self._emit_delta("\n")
+                            current_text_block = False
+
+                    return await stream.get_final_message()
+
+            except anthropic.RateLimitError:
+                retry_after = min(2 ** attempt * 2, 30)
+                await self._log(f"Rate limited (429) — retrying in {retry_after}s (attempt {attempt + 1}/5)")
+                await asyncio.sleep(retry_after)
+
+        raise anthropic.RateLimitError("Rate limited after 5 retries")
+
+    def _emit_delta(self, text: str):
+        """Emit a text delta for streaming display."""
+        if self.on_event:
+            try:
+                self.on_event({"type": "text_delta", "text": text})
+            except Exception:
+                pass
 
     async def _log(self, msg: str):
         """Emit an event log line."""
@@ -464,7 +520,7 @@ class Nucleus:
         print(f"  [{self.cell_id}] {msg}")
         if self.on_event:
             try:
-                self.on_event(msg)
+                self.on_event(msg)  # string events go through as before
                 await asyncio.sleep(0)
             except Exception:
                 pass
@@ -528,14 +584,18 @@ CONSUMER CODE CAPABILITIES:
 My authored consumer code has three capabilities:
 - **state** (dict) — In-memory state for windows, counters, rolling stats. Fast but lost on restart.
 - **knowledge** — My persistent store, built dynamically:
-  - Create my own Postgres tables (CREATE TABLE in my schema)
-  - Store and query structured data (INSERT, SELECT, UPDATE)
-  - Store vector embeddings for semantic search
-  - Persist key-value state that survives restarts
+  - **SQL tables**: Create my own Postgres tables for structured data (metrics, IP scores, device profiles, alert history)
+  - **Vector embeddings**: Store text via `knowledge.store_embedding(content, category)` — uses sentence-transformers to encode meaning into 384-dim vectors with HNSW indexing. Use for attack pattern signatures, anomaly descriptions, incident summaries — anything I want to find by semantic similarity later.
+  - **Semantic search**: `knowledge.search(query)` finds entries by meaning, not keywords. "lateral movement" matches "cross-VLAN SSH brute force".
+  - **Hybrid search**: `knowledge.hybrid_search(query, keyword=)` combines vector similarity with full-text for best results.
+  - **Key-value state**: `knowledge.get/set` for persistent config that survives restarts.
 - **alerts** — Return dicts from process_event to emit to my output topic.
 
 When writing consumer code:
-- Create whatever persistent data structures I need in `init()`
+- Create SQL tables for structured metrics AND embed descriptions for semantic retrieval
+- For example: store an IP score in a SQL table AND embed a description of why it's suspicious
+- Use `store_embedding` when I observe a NEW pattern worth remembering (attack signature, anomaly type, device behavior)
+- Use `search` or `hybrid_search` to check if a current event matches known patterns before alerting
 - Process each event: detect patterns, update my knowledge, build baselines
 - Return alert dicts when detections occur
 - Handle edge cases (missing fields, type errors)
@@ -557,7 +617,7 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
             await self._log(f"API call → {ANTHROPIC_MODEL} (turn {turn + 1})")
             self._log_to_kafka("api_call", {"turn": turn + 1, "model": ANTHROPIC_MODEL, "mode": "reason"})
 
-            response = await self._api_call(
+            response = await self._api_call_stream(
                 model=ANTHROPIC_MODEL,
                 max_tokens=8192,
                 system=self._system_prompt(context),
@@ -723,7 +783,7 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
                 "mode": "chat",
             })
 
-            response = await self._api_call(
+            response = await self._api_call_stream(
                 model=ANTHROPIC_MODEL,
                 max_tokens=8192,
                 system=self._system_prompt(context),

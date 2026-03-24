@@ -93,26 +93,42 @@ class CellServer:
 
     async def _dispatch(self, command: str, request: dict, send_event) -> dict:
         if command == "add":
-            # Create cell, wire streaming, reason, auto-approve
+            # Create cell, wire streaming, auto-approve all consumers iteratively
             cell = self.orchestrator.create_cell(request["name"], request["directive"])
-            cell.nucleus.on_event = lambda msg: asyncio.ensure_future(send_event({"event": msg}))
+            cell.nucleus.on_event = lambda msg: asyncio.ensure_future(send_event(msg if isinstance(msg, dict) else {"event": msg}))
             try:
-                decisions = await cell.propose()
-                await cell.approve(decisions)
+                await cell.initialize()
+                # Propose and approve consumers one at a time
+                while True:
+                    decisions = await cell.propose_next()
+                    has_consumer = any(d.get("decision_type") == "spawn_consumer" or d.get("action", {}).get("type") == "spawn_consumer" for d in decisions)
+                    await cell.approve(decisions)
+                    if not has_consumer:
+                        break
             finally:
                 cell.nucleus.on_event = None
             return {"ok": True, "cell": cell.inspect()}
 
-        elif command == "propose":
-            # Create cell, wire streaming, reason, return decisions for review
+        elif command == "init_cell":
+            # Create and initialize (no reasoning yet)
             cell = self.orchestrator.create_cell(request["name"], request["directive"])
-            cell.nucleus.on_event = lambda msg: asyncio.ensure_future(send_event({"event": msg}))
+            cell.nucleus.on_event = lambda msg: asyncio.ensure_future(send_event(msg if isinstance(msg, dict) else {"event": msg}))
             try:
-                decisions = await cell.propose()
+                await cell.initialize()
+            finally:
+                cell.nucleus.on_event = None
+            return {"ok": True, "cell_id": cell.cell_id, "name": cell.name}
+
+        elif command == "propose_next":
+            # Propose the next consumer
+            cell = self.orchestrator.get_cell(request["name"])
+            cell.nucleus.on_event = lambda msg: asyncio.ensure_future(send_event(msg if isinstance(msg, dict) else {"event": msg}))
+            try:
+                decisions = await cell.propose_next()
                 cell._pending_decisions = decisions
             finally:
                 cell.nucleus.on_event = None
-            return {"ok": True, "cell_id": cell.cell_id, "name": cell.name, "decisions": decisions}
+            return {"ok": True, "decisions": decisions}
 
         elif command == "approve":
             cell = self.orchestrator.get_cell(request["name"])
@@ -122,6 +138,18 @@ class CellServer:
             await cell.approve(approved)
             cell._pending_decisions = []
             return {"ok": True, "cell": cell.inspect()}
+
+        elif command == "verify":
+            cell = self.orchestrator.get_cell(request["name"])
+            cell.nucleus.on_event = lambda msg: asyncio.ensure_future(send_event(msg if isinstance(msg, dict) else {"event": msg}))
+            try:
+                summary = await cell.verify(
+                    max_iterations=request.get("max_iterations", 5),
+                    settle_seconds=request.get("settle_seconds", 15),
+                )
+            finally:
+                cell.nucleus.on_event = None
+            return {"ok": True, "summary": summary, "cell": cell.inspect()}
 
         elif command == "reject":
             name = request["name"]
@@ -171,7 +199,7 @@ class CellServer:
 
         elif command == "chat":
             cell = self.orchestrator.get_cell(request["name"])
-            cell.nucleus.on_event = lambda msg: asyncio.ensure_future(send_event({"event": msg}))
+            cell.nucleus.on_event = lambda msg: asyncio.ensure_future(send_event(msg if isinstance(msg, dict) else {"event": msg}))
             try:
                 reply, pending_actions = await cell.chat(request["message"])
             finally:

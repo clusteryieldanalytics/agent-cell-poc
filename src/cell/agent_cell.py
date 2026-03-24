@@ -52,29 +52,45 @@ class AgentCell:
         # Wire nucleus decision logging to Kafka
         self.nucleus.on_decision = self._log_decision
 
-    async def propose(self) -> list[dict]:
-        """Phase 1: Initialize the cell and ask the nucleus to propose consumers.
-        Returns the proposed decisions for operator review without spawning anything."""
+    async def initialize(self):
+        """Initialize the cell's knowledge base and register it."""
         print(f"[{self.name}] Starting cell...")
         self.knowledge.initialize()
         self.status = CellStatus.INITIALIZING
         self._register()
 
-        print(f"[{self.name}] Nucleus reasoning about directive...")
-        decisions = await self.nucleus.reason(
-            "You have just been activated. Review the available Kafka topics and their schemas. "
-            "Your job is to author and spawn Kafka consumers that fulfill your directive. "
-            "For each consumer, write the complete Python processing logic — the init() and "
-            "process_event() functions — that will run autonomously on every event. "
-            "Use the spawn_consumer tool now to create your consumers. You MUST call spawn_consumer "
-            "at least once."
-        )
+    async def propose_next(self) -> list[dict]:
+        """Propose the next consumer. Returns decisions for one consumer.
 
-        print(f"[{self.name}] Nucleus proposed {len(decisions)} decisions")
+        Call repeatedly until it returns no spawn_consumer decisions,
+        which means the nucleus has no more consumers to propose.
+        """
+        # Build context about what's already running
+        existing = self.consumer_manager.list_consumers()
+        if not existing:
+            prompt = (
+                "You have just been activated. Review the available Kafka topics and their schemas. "
+                "Your job is to author and spawn Kafka consumers that fulfill your directive. "
+                "Propose your FIRST and most important consumer now. Write the complete Python "
+                "processing logic — the init() and process_event() functions. "
+                "Call spawn_consumer EXACTLY ONCE with this consumer."
+            )
+        else:
+            consumer_summary = json.dumps(existing, indent=2)
+            prompt = (
+                f"You currently have {len(existing)} consumer(s) running:\n{consumer_summary}\n\n"
+                "Do you need another consumer to fully fulfill your directive? If yes, propose "
+                "the next consumer by calling spawn_consumer EXACTLY ONCE. If you have enough "
+                "consumers to cover your directive, respond with text only explaining why you're done."
+            )
+
+        print(f"[{self.name}] Nucleus proposing next consumer...")
+        decisions = await self.nucleus.reason(prompt)
+        print(f"[{self.name}] Nucleus returned {len(decisions)} decisions")
         return decisions
 
     async def approve(self, decisions: list[dict]):
-        """Phase 2: Execute approved decisions and activate the cell."""
+        """Execute approved decisions and activate the cell."""
         self.status = CellStatus.ACTIVE
 
         for decision in decisions:
@@ -85,6 +101,109 @@ class AgentCell:
         self._persist_consumers()
         self._update_status("active")
         print(f"[{self.name}] Cell active with {len(self.consumer_manager.consumers)} consumers")
+
+    async def verify(self, max_iterations: int = 5, settle_seconds: int = 15) -> dict:
+        """Phase 3: Iteratively verify consumers and self-fix until stable.
+
+        Waits for events to flow, checks DLQs for errors, samples output topics,
+        and asks the nucleus to fix any issues. Returns a summary of the verification.
+
+        Args:
+            max_iterations: max fix attempts before giving up
+            settle_seconds: how long to wait for events between checks
+        """
+        from src.cell.consumer import ConsumerManager as CM
+
+        summary = {"iterations": 0, "fixes": [], "stable": False, "errors_found": 0}
+
+        for iteration in range(max_iterations):
+            summary["iterations"] = iteration + 1
+            await self.nucleus._log(f"Verification pass {iteration + 1}/{max_iterations} — waiting {settle_seconds}s for events...")
+
+            # Sleep in small increments so event streaming stays alive
+            for elapsed in range(settle_seconds):
+                await asyncio.sleep(1)
+                # Emit a progress tick every 5 seconds
+                if (elapsed + 1) % 5 == 0:
+                    total_events = sum(m.events_processed for m in self.consumer_manager.consumers.values())
+                    total_errors = sum(m.errors for m in self.consumer_manager.consumers.values())
+                    await self.nucleus._log(f"  ... {elapsed + 1}s elapsed — {total_events} events, {total_errors} errors")
+
+            # Check each consumer for errors
+            all_healthy = True
+            for managed in list(self.consumer_manager.consumers.values()):
+                cid = managed.spec.consumer_id
+
+                # Check DLQ
+                dlq_entries = await CM.read_dlq(managed.dlq_topic, limit=5)
+                # Only care about recent errors (from this verification run)
+                recent_errors = [e for e in dlq_entries if e.get("error")]
+
+                if recent_errors and managed.errors > 0:
+                    all_healthy = False
+                    summary["errors_found"] += len(recent_errors)
+                    error_sample = recent_errors[-1]
+                    await self.nucleus._log(
+                        f"Consumer '{cid}' has {managed.errors} errors. "
+                        f"Latest: {error_sample.get('error_type', '?')}: {error_sample.get('error', '?')[:100]}"
+                    )
+
+                    # Ask nucleus to diagnose and fix
+                    await self.nucleus._log(f"Asking nucleus to fix '{cid}'...")
+
+                    # Build a focused prompt with the error details
+                    error_details = json.dumps(recent_errors[-3:], indent=2, default=str)
+                    current_code = managed.spec.consumer_code
+
+                    fix_decisions = await self.nucleus.reason(
+                        f"My consumer '{cid}' is failing with errors. Here are the most recent DLQ entries:\n\n"
+                        f"{error_details}\n\n"
+                        f"Here is the current consumer code:\n```python\n{current_code}\n```\n\n"
+                        f"Fix the code and call spawn_consumer with the corrected version. "
+                        f"Keep the same consumer_id '{cid}', source_topics, and output_topic. "
+                        f"IMPORTANT: Fix the root cause shown in the error, don't just add try/except."
+                    )
+
+                    # Execute any spawn_consumer decisions as replacements
+                    for decision in fix_decisions:
+                        action = decision.get("action", {})
+                        if action.get("type") == "spawn_consumer" and action.get("consumer_code"):
+                            # Treat as a replace
+                            action["consumer_id"] = cid
+                            result = await self.replace_consumer(action)
+                            await self.nucleus._log(f"Fix result: {result}")
+                            summary["fixes"].append({
+                                "consumer_id": cid,
+                                "iteration": iteration + 1,
+                                "error": error_sample.get("error", ""),
+                                "result": result,
+                            })
+                            break
+
+                elif managed.events_processed == 0:
+                    # Warning only — don't trigger a fix attempt, the code may be fine
+                    # (wrong topic, consumer group lag, slow startup)
+                    await self.nucleus._log(f"Consumer '{cid}' has processed 0 events after {settle_seconds}s — waiting for data")
+
+                else:
+                    await self.nucleus._log(
+                        f"Consumer '{cid}' healthy — {managed.events_processed} events, "
+                        f"{managed.alerts_emitted} alerts, {managed.errors} errors"
+                    )
+
+            if all_healthy:
+                await self.nucleus._log("All consumers healthy and processing events. Verification complete.")
+                summary["stable"] = True
+                break
+
+        if not summary["stable"]:
+            await self.nucleus._log(
+                f"Verification ended after {summary['iterations']} iterations. "
+                f"{summary['errors_found']} errors found, {len(summary['fixes'])} fixes applied."
+            )
+
+        self._persist_consumers()
+        return summary
 
     async def start(self):
         """Initialize, propose, and immediately approve all consumers (no review)."""

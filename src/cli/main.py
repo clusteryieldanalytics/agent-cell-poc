@@ -41,8 +41,15 @@ def _send(command: dict, timeout: float = 600, stream: bool = False) -> dict:
             if data.get("done"):
                 response = data
                 break
-            elif stream and data.get("event"):
-                _print_event(data["event"])
+            elif stream:
+                if data.get("type") == "text_delta":
+                    # Stream of thought — render with dim styling and line prefix
+                    text = data["text"]
+                    # Prefix newlines with the continuation marker
+                    text = text.replace("\n", "\n  [dim italic]│[/dim italic] ")
+                    console.print(f"[dim italic]{text}[/dim italic]", end="", highlight=False)
+                elif data.get("event"):
+                    _print_event(data["event"])
 
         writer.close()
         await writer.wait_closed()
@@ -89,6 +96,33 @@ def _print_events(events: list[str]):
         _print_event(event)
 
 
+def _run_verification(name: str, max_iterations: int = 5, settle_seconds: int = 15):
+    """Run the self-verification loop, streaming events to the console."""
+    console.print(f"\n[bold cyan]Verifying consumers (up to {max_iterations} iterations, {settle_seconds}s settle)...[/]\n")
+    response = _send(
+        {"command": "verify", "name": name, "max_iterations": max_iterations, "settle_seconds": settle_seconds},
+        stream=True,
+    )
+    _check_error(response)
+
+    summary = response.get("summary", {})
+    fixes = summary.get("fixes", [])
+    stable = summary.get("stable", False)
+
+    if stable:
+        console.print(f"\n[bold green]Verification passed[/] — all consumers stable after {summary.get('iterations', '?')} iteration(s)")
+    else:
+        console.print(f"\n[bold yellow]Verification incomplete[/] — {summary.get('errors_found', 0)} errors, {len(fixes)} fixes applied")
+
+    if fixes:
+        console.print()
+        for f in fixes:
+            status = "[green]fixed[/]" if "replaced and running" in f.get("result", "") else f"[red]{f.get('result', '?')}[/]"
+            console.print(f"  Iteration {f['iteration']}: {f['consumer_id']} — {f.get('error', '?')[:60]} → {status}")
+
+    console.print()
+
+
 @app.command()
 def server():
     """Start the persistent cell server (run this first)."""
@@ -102,109 +136,105 @@ def add(
     name: str = typer.Option(..., "--name", "-n", help="Cell name"),
     directive: str = typer.Option(..., "--directive", "-d", help="Cell directive"),
     auto_approve: bool = typer.Option(False, "--yes", "-y", help="Skip approval and auto-approve all consumers"),
+    verify: bool = typer.Option(True, "--verify/--no-verify", help="Run self-verification after each consumer"),
+    max_iterations: int = typer.Option(3, "--max-iters", help="Max verification fix iterations per consumer"),
+    settle_seconds: int = typer.Option(15, "--settle", help="Seconds to wait between verification checks"),
 ):
-    """Add a new agent cell. Shows proposed consumer code for approval."""
-    # Phase 1: Propose — nucleus reasons about what consumers to author
+    """Add a new agent cell. Proposes consumers one at a time: author → approve → verify → next."""
     console.print(Panel(
         f"[bold]Directive:[/] {directive[:200]}{'...' if len(directive) > 200 else ''}",
         title=f"Creating cell '{name}'",
     ))
-    console.print(f"\n[bold cyan]Nucleus reasoning...[/]\n")
 
-    response = _send({"command": "propose", "name": name, "directive": directive}, stream=True)
+    # Initialize the cell
+    console.print(f"\n[bold cyan]Initializing cell...[/]\n")
+    response = _send({"command": "init_cell", "name": name, "directive": directive}, stream=True)
     _check_error(response)
-    console.print()
 
-    decisions = response.get("decisions", [])
-    consumer_decisions = [d for d in decisions if d.get("decision_type") == "spawn_consumer"]
+    consumer_num = 0
 
-    if not consumer_decisions:
-        console.print("[yellow]Nucleus did not propose any consumers.[/]")
-        for d in decisions:
-            if d.get("reasoning"):
-                console.print(f"  [dim]{d['reasoning'][:200]}[/]")
-        _send({"command": "reject", "name": name})
-        return
+    # Iterative loop: propose one consumer at a time
+    while True:
+        consumer_num += 1
+        console.print(f"\n[bold cyan]{'─' * 60}[/]")
+        console.print(f"[bold cyan]Proposing consumer #{consumer_num}...[/]\n")
 
-    console.print(f"[bold]Proposed {len(consumer_decisions)} consumer(s):[/]\n")
-
-    # Auto-approve mode
-    if auto_approve:
-        console.print("[dim]Auto-approving all consumers (--yes)[/]\n")
-        response = _send({"command": "approve", "name": name, "approved": list(range(len(decisions)))})
+        response = _send({"command": "propose_next", "name": name}, stream=True)
         _check_error(response)
-        info = response["cell"]
-        for d in consumer_decisions:
-            action = d.get("action", {})
-            console.print(f"  [green]✓[/] {action.get('consumer_id', '?')}  {', '.join(action.get('source_topics', []))} → {action.get('output_topic', '?')}")
-        console.print(Panel(
-            f"[bold green]Cell '{name}' active[/]\n"
-            f"Cell ID: {info['cell_id']}\n"
-            f"Consumers: {len(info['consumers'])}",
-            title="Cell Created",
-        ))
-        return
 
-    # Interactive approval — show each consumer for review
-    approved_indices = []
-    for i, d in enumerate(decisions):
-        if d.get("decision_type") != "spawn_consumer":
-            approved_indices.append(i)
-            continue
+        decisions = response.get("decisions", [])
+        consumer_decisions = [d for d in decisions if d.get("decision_type") == "spawn_consumer" or d.get("action", {}).get("type") == "spawn_consumer"]
 
+        if not consumer_decisions:
+            # Nucleus says it's done
+            console.print("[dim]Nucleus has no more consumers to propose.[/]")
+            for d in decisions:
+                reasoning = d.get("reasoning", "")
+                if reasoning:
+                    console.print(f"  [dim]{reasoning[:200]}[/]")
+            break
+
+        # Show the proposed consumer
+        d = consumer_decisions[0]
         action = d.get("action", {})
         consumer_id = action.get("consumer_id", "?")
         topics = action.get("source_topics", [])
         output = action.get("output_topic", "?")
         code = action.get("consumer_code", "")
+        description = action.get("description", "")
+        patterns = action.get("detection_patterns", [])
 
-        # Header with consumer info
-        console.print(f"{'─' * 60}")
         console.print(f"  Consumer:  [bold cyan]{consumer_id}[/]")
         console.print(f"  Topics:    {', '.join(topics)} → [green]{output}[/]")
-
-        # Show reasoning
+        if description:
+            console.print(f"  Purpose:   {description[:120]}")
+        if patterns:
+            console.print(f"  Detects:   {', '.join(patterns)}")
         if d.get("reasoning"):
             console.print(f"  Reasoning: [dim]{d['reasoning'][:200]}{'...' if len(d.get('reasoning', '')) > 200 else ''}[/]")
         console.print()
 
-        # Show the authored code
-        console.print(Syntax(code, "python", theme="monokai", line_numbers=True))
-        console.print()
+        if code:
+            console.print(Syntax(code, "python", theme="monokai", line_numbers=True))
+            console.print()
 
-        # Prompt
-        choice = Prompt.ask(
-            f"  Approve '[cyan]{consumer_id}[/]'? [green]y[/]es / [red]n[/]o / [yellow]q[/]uit",
-            choices=["y", "n", "q"],
-            default="y",
-        )
-
-        if choice == "q":
-            console.print("[yellow]Aborting — rejecting all.[/]")
-            _send({"command": "reject", "name": name})
-            return
-        elif choice == "y":
-            approved_indices.append(i)
-            console.print(f"  [green]✓ Approved[/]\n")
+        # Approval gate
+        if auto_approve:
+            console.print(f"  [green]✓ Auto-approved[/]")
+            approved_indices = list(range(len(decisions)))
         else:
-            console.print(f"  [red]✗ Rejected[/]\n")
+            choice = Prompt.ask(
+                f"  Approve '[cyan]{consumer_id}[/]'? [green]y[/]es / [red]n[/]o / [yellow]d[/]one (stop adding)",
+                choices=["y", "n", "d"],
+                default="y",
+            )
 
-    if not any(decisions[i].get("decision_type") == "spawn_consumer" for i in approved_indices):
-        console.print("[yellow]No consumers approved. Cancelling cell.[/]")
-        _send({"command": "reject", "name": name})
-        return
+            if choice == "d":
+                console.print("[dim]Stopping — no more consumers will be added.[/]")
+                break
+            elif choice == "n":
+                console.print(f"  [red]✗ Rejected[/]")
+                continue  # Ask for the next proposal
+            else:
+                approved_indices = list(range(len(decisions)))
+                console.print(f"  [green]✓ Approved[/]")
 
-    # Phase 2: Spawn approved consumers
-    console.print(f"\n[bold cyan]Spawning approved consumers...[/]")
-    response = _send({"command": "approve", "name": name, "approved": approved_indices})
-    _check_error(response)
+        # Spawn the approved consumer
+        console.print(f"\n  [cyan]Spawning '{consumer_id}'...[/]")
+        response = _send({"command": "approve", "name": name, "approved": approved_indices})
+        _check_error(response)
 
-    info = response["cell"]
+        # Verify this consumer
+        if verify:
+            _run_verification(name, max_iterations, settle_seconds)
+
+    # Final summary
+    info = _send({"command": "inspect", "name": name}).get("cell", {})
     console.print(Panel(
         f"[bold green]Cell '{name}' active[/]\n"
-        f"Cell ID: {info['cell_id']}\n"
-        f"Consumers: {len(info['consumers'])}\n"
-        f"Decision topic: {info['decision_topic']}",
+        f"Cell ID: {info.get('cell_id', '?')}\n"
+        f"Consumers: {len(info.get('consumers', []))}\n"
+        f"Decision topic: {info.get('decision_topic', '?')}",
         title="Cell Created",
     ))
 
@@ -468,10 +498,27 @@ def inspect(name: str = typer.Option(..., "--name", "-n")):
         kb_table.add_column("Rows", justify="right")
         kb_table.add_column("Size", justify="right")
         kb_table.add_column("Type")
+        kb_table.add_column("Indexes")
         for tname, tinfo in tables.items():
             ttype = "[dim]built-in[/]" if tname in ("knowledge", "state") else "[green]custom[/]"
-            kb_table.add_row(tname, str(tinfo["rows"]), tinfo["size"], ttype)
+            idx_list = tinfo.get("indexes", [])
+            idx_display = ""
+            for idx in idx_list:
+                if idx == "vector":
+                    idx_display += "[magenta]vector[/] "
+                elif idx == "vector*":
+                    idx_display += "[dim magenta]vector*[/] "
+                elif idx == "fts":
+                    idx_display += "[cyan]fts[/] "
+                elif idx == "fts*":
+                    idx_display += "[dim cyan]fts*[/] "
+                elif idx == "gin":
+                    idx_display += "[yellow]gin[/] "
+                else:
+                    idx_display += f"[dim]{idx}[/] "
+            kb_table.add_row(tname, str(tinfo["rows"]), tinfo["size"], ttype, idx_display.strip() or "[dim]-[/]")
         console.print(kb_table)
+        console.print("[dim]  * = column exists but no index[/]")
     else:
         console.print("[dim]No knowledge base tables found.[/]")
 
@@ -754,6 +801,16 @@ def dlq(
                 latest_str,
             )
         console.print(table)
+
+
+@app.command(name="verify")
+def verify_cell(
+    name: str = typer.Option(..., "--name", "-n", help="Cell name"),
+    max_iterations: int = typer.Option(5, "--max-iters", help="Max fix iterations"),
+    settle_seconds: int = typer.Option(15, "--settle", help="Seconds between checks"),
+):
+    """Run self-verification on a cell's consumers. Checks DLQs and auto-fixes errors."""
+    _run_verification(name, max_iterations, settle_seconds)
 
 
 @app.command()
