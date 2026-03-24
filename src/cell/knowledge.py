@@ -221,17 +221,59 @@ class KnowledgeStore:
                 (self.schema,),
             ).fetchall()
 
+            # Get all indexes in the schema
+            indexes = conn.execute(
+                """SELECT tablename, indexname, indexdef
+                   FROM pg_indexes
+                   WHERE schemaname = %s""",
+                (self.schema,),
+            ).fetchall()
+
+            # Build per-table index info
+            table_indexes: dict[str, list[str]] = {}
+            for tbl, idx_name, idx_def in indexes:
+                if tbl not in table_indexes:
+                    table_indexes[tbl] = []
+                idx_def_lower = idx_def.lower()
+                if "hnsw" in idx_def_lower or "ivfflat" in idx_def_lower:
+                    table_indexes[tbl].append("vector")
+                elif "gin" in idx_def_lower and "tsvector" in idx_def_lower:
+                    table_indexes[tbl].append("fts")
+                elif "gin" in idx_def_lower:
+                    table_indexes[tbl].append("gin")
+                elif "btree" in idx_def_lower or "pkey" in idx_name:
+                    pass  # skip default btree/pkey
+                else:
+                    table_indexes[tbl].append("idx")
+
             tables = {}
             custom_tables = []
             for tname, size_bytes in all_tables:
-                # Exact row count
                 row_count = conn.execute(
                     f"SELECT COUNT(*) FROM {self.schema}.{tname}"
                 ).fetchone()[0]
+
+                # Check for vector and tsvector columns
+                col_types = conn.execute(
+                    "SELECT column_name, data_type, udt_name FROM information_schema.columns "
+                    "WHERE table_schema = %s AND table_name = %s",
+                    (self.schema, tname),
+                ).fetchall()
+                has_vector = any(udt == "vector" for _, _, udt in col_types)
+                has_tsvector = any(udt == "tsvector" for _, _, udt in col_types)
+
+                # Determine index types present
+                idx_types = set(table_indexes.get(tname, []))
+                if has_vector and "vector" not in idx_types:
+                    idx_types.add("vector*")  # has column but no index
+                if has_tsvector and "fts" not in idx_types:
+                    idx_types.add("fts*")  # has column but no index
+
                 tables[tname] = {
                     "rows": row_count,
                     "size": _human_size(size_bytes),
                     "size_bytes": size_bytes,
+                    "indexes": sorted(idx_types) if idx_types else [],
                 }
                 if tname not in ("knowledge", "state"):
                     custom_tables.append(tname)
