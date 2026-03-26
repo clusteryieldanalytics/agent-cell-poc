@@ -26,6 +26,10 @@ DEVICE_POLL_INTERVAL_SECONDS = 30
 SYSLOG_EVENTS_PER_SECOND = 20
 ANOMALY_INTERVAL_RANGE = (120, 300)  # 2-5 minutes
 
+# Flink SQL runtime
+FLINK_REST_URL = os.getenv("FLINK_REST_URL", "http://localhost:8083")
+FLINK_DASHBOARD_URL = os.getenv("FLINK_DASHBOARD_URL", "http://localhost:8081")
+
 # Self-audit: periodic autonomous review of consumer health and tuning (0 = disabled)
 SELF_AUDIT_INTERVAL_SECONDS = int(os.getenv("SELF_AUDIT_INTERVAL_SECONDS", "0"))
 

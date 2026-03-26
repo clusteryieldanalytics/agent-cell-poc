@@ -38,7 +38,7 @@ def _normal_flow() -> dict:
     src_ip = _random_internal_ip()
     dst_ip = _random_external_ip() if random.random() < 0.8 else _random_internal_ip()
     return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
         "src_ip": src_ip,
         "dst_ip": dst_ip,
         "src_port": random.randint(1024, 65535),
@@ -58,7 +58,7 @@ def _normal_flow() -> dict:
 def _anomaly_flows(anomaly) -> list[dict]:
     """Generate flows for an active anomaly."""
     flows = []
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     p = anomaly.params
 
     if anomaly.anomaly_type == AnomalyType.PORT_SCAN:

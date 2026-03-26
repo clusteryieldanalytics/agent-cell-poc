@@ -49,6 +49,9 @@ class AgentCell:
         # Dashboard registry (set by orchestrator after creation)
         self.dashboard_registry = None
 
+        # Track failed spawns so propose_next doesn't re-propose them
+        self._failed_spawns: list[dict] = []  # [{consumer_id, runtime, error}, ...]
+
         # Wire nucleus decision logging to Kafka
         self.nucleus.on_decision = self._log_decision
 
@@ -59,33 +62,181 @@ class AgentCell:
         self.status = CellStatus.INITIALIZING
         self._register()
 
-    async def propose_next(self) -> list[dict]:
-        """Propose the next consumer. Returns decisions for one consumer.
+    async def plan_architecture(self) -> str:
+        """Phase 1: Sample live data, then ask the nucleus to produce an architecture plan.
 
-        Call repeatedly until it returns no spawn_consumer decisions,
-        which means the nucleus has no more consumers to propose.
+        Samples events from all source topics so the nucleus can see actual data shapes,
+        field values, event rates, and volume before designing consumers and choosing thresholds.
+
+        Returns the plan text. The plan is stored on the cell and used as context
+        for subsequent propose_next() calls.
         """
-        # Build context about what's already running
+        from src.cell.kafka_tools import sample_topic, topic_stats
+        from src.config import TOPIC_FLOWS, TOPIC_DEVICE_STATUS, TOPIC_SYSLOG
+
+        # Reconnaissance: sample live data from source topics
+        print(f"[{self.name}] Sampling source topics for reconnaissance...")
+        source_topics = [TOPIC_FLOWS, TOPIC_DEVICE_STATUS, TOPIC_SYSLOG]
+        recon_sections = []
+
+        try:
+            stats = await topic_stats(source_topics)
+            recon_sections.append(f"Topic stats:\n{json.dumps(stats, indent=2, default=str)}")
+        except Exception as e:
+            recon_sections.append(f"Could not get topic stats: {e}")
+
+        for topic in source_topics:
+            try:
+                samples = await sample_topic(topic, count=3)
+                if samples:
+                    recon_sections.append(
+                        f"Sample events from {topic} ({len(samples)} samples):\n"
+                        + json.dumps(samples, indent=2, default=str)
+                    )
+                else:
+                    recon_sections.append(f"No events found in {topic}")
+            except Exception as e:
+                recon_sections.append(f"Could not sample {topic}: {e}")
+
+        recon_data = "\n\n".join(recon_sections)
+        print(f"[{self.name}] Reconnaissance complete — {len(recon_sections)} sections")
+
+        prompt = (
+            "You have just been activated. Before writing any code, I've sampled live data from "
+            "the source topics so you can see the actual event shapes, field names, value ranges, "
+            "and volume.\n\n"
+            f"LIVE DATA SAMPLES:\n{recon_data}\n\n"
+            "Study these samples carefully. Note:\n"
+            "- The actual field names and types in each event (use these exactly in your code)\n"
+            "- Value ranges (IP addresses, port numbers, byte counts, device IDs)\n"
+            "- Event rates and volume (from topic stats)\n"
+            "- What anomalies or patterns might look like in this data\n\n"
+            "Now design your consumer architecture. Think through the tradeoffs:\n"
+            "- What processing does my directive require? Which data sources?\n"
+            "- What's the simplest design that covers everything? Could one consumer do it?\n"
+            "- Where does splitting into multiple consumers earn its keep?\n"
+            "- Does the workload genuinely benefit from Flink SQL?\n\n"
+            "For each planned consumer, specify:\n"
+            "- Consumer ID, runtime (flink_sql or python), source topics → output topic\n"
+            "- What it does and WHY it's a separate consumer (not merged into another)\n"
+            "- Key thresholds and detection parameters, justified by the data samples above\n"
+            "  (e.g., 'baseline bytes_sent is ~15K-900K, so I'll flag transfers >5MB as unusual')\n"
+            "- Deployment order (Flink first if Python depends on its output)\n\n"
+            "DO NOT call any tools. Respond with text only — your architecture plan. "
+            "I will ask you to implement each consumer one at a time after this."
+        )
+
+        print(f"[{self.name}] Nucleus planning architecture...")
+        decisions = await self.nucleus.reason(prompt)
+        # Extract the plan text from reasoning decisions
+        plan_text = ""
+        for d in decisions:
+            if d.get("reasoning"):
+                plan_text += d["reasoning"] + "\n"
+
+        self._architecture_plan = plan_text.strip()
+
+        # Store the plan in knowledge base for future reference
+        if self._architecture_plan:
+            try:
+                self.knowledge.store(
+                    f"Architecture plan:\n{self._architecture_plan}",
+                    "design_rationale",
+                    {"type": "architecture_plan"},
+                )
+            except Exception:
+                pass
+
+        print(f"[{self.name}] Architecture plan ready ({len(self._architecture_plan)} chars)")
+        return self._architecture_plan
+
+    async def propose_next(self) -> list[dict]:
+        """Phase 2: Propose the next consumer, one at a time, following the architecture plan.
+
+        Call repeatedly until it returns no spawn_consumer decisions.
+        """
         existing = self.consumer_manager.list_consumers()
+
+        # Enrich Flink consumers with live status
+        flink_consumers = [m for m in self.consumer_manager.consumers.values() if m.flink_job_id]
+        if flink_consumers:
+            try:
+                flink = self.consumer_manager._get_flink_runtime()
+                for m in flink_consumers:
+                    for c in existing:
+                        if c["consumer_id"] == m.spec.consumer_id:
+                            try:
+                                status = flink.status(m.flink_job_id)
+                                c["flink_status"] = status.get("state", "UNKNOWN")
+                                metrics = flink.job_metrics(m.flink_job_id)
+                                c["flink_records_in"] = metrics.get("total_read_records", 0)
+                                c["flink_records_out"] = metrics.get("total_write_records", 0)
+                            except Exception:
+                                c["flink_status"] = "UNREACHABLE"
+                            break
+            except Exception:
+                pass
+
+        plan_context = ""
+        if hasattr(self, '_architecture_plan') and self._architecture_plan:
+            plan_context = f"\n\nYOUR ARCHITECTURE PLAN (designed before any consumers were deployed):\n{self._architecture_plan}\n"
+
+        # Build a clear status summary of deployed consumers
+        deployed_context = ""
+        if existing:
+            lines = []
+            for c in existing:
+                cid = c["consumer_id"]
+                runtime = c.get("runtime", "python")
+                status_parts = []
+                if runtime == "flink_sql":
+                    flink_status = c.get("flink_status", "")
+                    job_id = c.get("flink_job_id", "")
+                    status_parts.append(f"flink_sql, job={job_id}, state={flink_status or '?'}")
+                    records_in = c.get("flink_records_in", 0)
+                    records_out = c.get("flink_records_out", 0)
+                    if records_in or records_out:
+                        status_parts.append(f"{records_in} records in, {records_out} out")
+                else:
+                    status_parts.append(f"python, {'running' if c.get('running') else 'stopped'}")
+                    status_parts.append(f"{c.get('events_processed', 0)} events, {c.get('errors', 0)} errors")
+                topics = ", ".join(c.get("source_topics", []))
+                output = c.get("output_topic", "?")
+                lines.append(
+                    f"  ✓ {cid} ({', '.join(status_parts)})\n"
+                    f"    {topics} → {output}\n"
+                    f"    {c.get('description', '')[:100]}"
+                )
+            deployed_context = f"\n\nDEPLOYED AND RUNNING ({len(existing)} consumer(s)):\n" + "\n".join(lines) + "\n"
+
+        # Include info about failed spawns
+        failure_context = ""
+        if self._failed_spawns:
+            failure_lines = json.dumps(self._failed_spawns, indent=2)
+            failure_context = (
+                f"\n\nFAILED SPAWNS (attempted but failed — do NOT re-propose with the same code):\n"
+                f"{failure_lines}\n"
+                f"Fix the underlying issue or skip and move on.\n"
+            )
+
         if not existing:
             prompt = (
-                "You have just been activated. Review the available Kafka topics and their schemas. "
-                "Your job is to author and spawn Kafka consumers that fulfill your directive. "
-                "Propose your FIRST and most important consumer now. Write the complete Python "
-                "processing logic — the init() and process_event() functions. "
-                "Call spawn_consumer EXACTLY ONCE with this consumer."
+                f"{plan_context}{failure_context}\n"
+                "Now implement the FIRST consumer from your plan. Follow the deployment order "
+                "you specified. Call spawn_consumer EXACTLY ONCE with the complete code."
             )
         else:
-            consumer_summary = json.dumps(existing, indent=2)
             prompt = (
-                f"You currently have {len(existing)} consumer(s) running:\n{consumer_summary}\n\n"
-                "Do you need another consumer to fully fulfill your directive? If yes, propose "
-                "the next consumer by calling spawn_consumer EXACTLY ONCE. If you have enough "
-                "consumers to cover your directive, respond with text only explaining why you're done."
+                f"{deployed_context}{plan_context}{failure_context}\n"
+                "Implement the NEXT consumer from your plan that hasn't been deployed yet. "
+                "The consumers listed above under DEPLOYED AND RUNNING are already live — do not re-propose them. "
+                "Deploy the next one in sequence. Call spawn_consumer EXACTLY ONCE.\n\n"
+                "If ALL consumers from your plan are deployed, respond with text only explaining "
+                "that your pipeline is complete."
             )
 
         print(f"[{self.name}] Nucleus proposing next consumer...")
-        decisions = await self.nucleus.reason(prompt)
+        decisions = await self.nucleus.reason(prompt, single_spawn=True)
         print(f"[{self.name}] Nucleus returned {len(decisions)} decisions")
         return decisions
 
@@ -94,8 +245,20 @@ class AgentCell:
         self.status = CellStatus.ACTIVE
 
         for decision in decisions:
-            print(f"  [{self.name}] Executing: {decision.get('decision_type')}")
-            await self._execute_decision(decision)
+            dtype = decision.get('decision_type', decision.get('action', {}).get('type', '?'))
+            action = decision.get('action', {})
+            cid = action.get('consumer_id', '?')
+            print(f"  [{self.name}] Executing: {dtype}")
+            try:
+                await self._execute_decision(decision)
+            except Exception as e:
+                print(f"  [{self.name}] FAILED to execute {dtype} '{cid}': {e}")
+                if dtype == "spawn_consumer":
+                    self._failed_spawns.append({
+                        "consumer_id": cid,
+                        "runtime": action.get("runtime", "python"),
+                        "error": str(e),
+                    })
 
         self._decision_producer.flush(5)
         self._persist_consumers()
@@ -125,18 +288,177 @@ class AgentCell:
                 await asyncio.sleep(1)
                 # Emit a progress tick every 5 seconds
                 if (elapsed + 1) % 5 == 0:
-                    total_events = sum(m.events_processed for m in self.consumer_manager.consumers.values())
-                    total_errors = sum(m.errors for m in self.consumer_manager.consumers.values())
-                    await self.nucleus._log(f"  ... {elapsed + 1}s elapsed — {total_events} events, {total_errors} errors")
+                    py_events = 0
+                    py_errors = 0
+                    flink_records = 0
+                    for m in self.consumer_manager.consumers.values():
+                        if m.spec.runtime == "flink_sql":
+                            if m.flink_job_id:
+                                try:
+                                    flink = self.consumer_manager._get_flink_runtime()
+                                    metrics = flink.job_metrics(m.flink_job_id)
+                                    flink_records += metrics.get("total_read_records", 0)
+                                except Exception:
+                                    pass
+                        else:
+                            py_events += m.events_processed
+                            py_errors += m.errors
+
+                    parts = [f"{elapsed + 1}s elapsed"]
+                    parts.append(f"{py_events} python events, {py_errors} errors")
+                    if any(m.spec.runtime == "flink_sql" for m in self.consumer_manager.consumers.values()):
+                        parts.append(f"{flink_records} flink records")
+                    await self.nucleus._log(f"  ... {' — '.join(parts)}")
 
             # Check each consumer for errors
             all_healthy = True
             for managed in list(self.consumer_manager.consumers.values()):
                 cid = managed.spec.consumer_id
 
-                # Check DLQ
+                # Flink consumers: identified by runtime, not just flink_job_id
+                if managed.spec.runtime == "flink_sql":
+                    if not managed.flink_job_id:
+                        all_healthy = False
+                        summary["errors_found"] += 1
+                        await self.nucleus._log(
+                            f"Flink consumer '{cid}' has no job ID — "
+                            f"submit likely failed. Asking nucleus to fix..."
+                        )
+                        current_sql = managed.spec.consumer_code
+                        fix_decisions = await self.nucleus.reason(
+                            f"My Flink SQL consumer '{cid}' failed to submit — there is no Flink job running.\n\n"
+                            f"Source topics: {managed.spec.source_topics}\n"
+                            f"Current SQL:\n```sql\n{current_sql}\n```\n\n"
+                            f"The SQL was rejected by the Flink SQL Gateway. Common causes:\n"
+                            f"- Syntax errors in the SQL\n"
+                            f"- Wrong bootstrap server (must use 'kafka:29092' for Flink)\n"
+                            f"- Missing semicolons between statements\n"
+                            f"- Invalid column types or watermark definitions\n\n"
+                            f"Fix the SQL and call spawn_consumer with runtime='flink_sql'. "
+                            f"Keep consumer_id '{cid}'."
+                        )
+                        for decision in fix_decisions:
+                            action = decision.get("action", {})
+                            if action.get("type") == "spawn_consumer" and action.get("consumer_code"):
+                                action["consumer_id"] = cid
+                                action["runtime"] = "flink_sql"
+                                result = await self.replace_consumer(action)
+                                await self.nucleus._log(f"Fix result: {result}")
+                                summary["fixes"].append({
+                                    "consumer_id": cid,
+                                    "iteration": iteration + 1,
+                                    "error": "Flink job not submitted",
+                                    "result": result,
+                                })
+                                break
+                        continue
+
+                    try:
+                        flink = self.consumer_manager._get_flink_runtime()
+                        status = flink.status(managed.flink_job_id)
+                        state = status.get("state", "UNKNOWN")
+                    except Exception as e:
+                        all_healthy = False
+                        await self.nucleus._log(f"Flink consumer '{cid}' — could not reach Flink: {e}")
+                        continue
+
+                    if state in ("FAILED", "CANCELED"):
+                        all_healthy = False
+                        summary["errors_found"] += 1
+                        error_detail = ""
+                        try:
+                            exc = flink.job_exceptions(managed.flink_job_id)
+                            error_detail = exc.get("root_exception", "")[:300]
+                        except Exception:
+                            pass
+                        await self.nucleus._log(
+                            f"Flink consumer '{cid}' — job {state}"
+                            + (f": {error_detail}" if error_detail else "")
+                        )
+                        # Ask nucleus to fix
+                        current_sql = managed.spec.consumer_code
+                        fix_decisions = await self.nucleus.reason(
+                            f"My Flink SQL consumer '{cid}' (job {managed.flink_job_id}) has {state}.\n"
+                            f"{'Root exception: ' + error_detail if error_detail else ''}\n\n"
+                            f"Current SQL:\n```sql\n{current_sql}\n```\n\n"
+                            f"Fix the SQL and call spawn_consumer with runtime='flink_sql'. "
+                            f"Keep consumer_id '{cid}'."
+                        )
+                        for decision in fix_decisions:
+                            action = decision.get("action", {})
+                            if action.get("type") == "spawn_consumer" and action.get("consumer_code"):
+                                action["consumer_id"] = cid
+                                action["runtime"] = "flink_sql"
+                                result = await self.replace_consumer(action)
+                                await self.nucleus._log(f"Fix result: {result}")
+                                summary["fixes"].append({
+                                    "consumer_id": cid,
+                                    "iteration": iteration + 1,
+                                    "error": f"Flink job {state}",
+                                    "result": result,
+                                })
+                                break
+                        continue
+
+                    if state != "RUNNING":
+                        await self.nucleus._log(f"Flink consumer '{cid}' — job state: {state}")
+                        continue
+
+                    # Job is RUNNING — check if it's actually processing records
+                    records_in = 0
+                    try:
+                        metrics = flink.job_metrics(managed.flink_job_id)
+                        records_in = metrics.get("total_read_records", 0)
+                        records_out = metrics.get("total_write_records", 0)
+                    except Exception:
+                        # Can't get metrics — treat as 0 to trigger investigation
+                        records_out = 0
+
+                    if records_in == 0:
+                        all_healthy = False
+                        summary["errors_found"] += 1
+                        await self.nucleus._log(
+                            f"Flink consumer '{cid}' RUNNING but 0 records read after {settle_seconds}s — investigating..."
+                        )
+                        current_sql = managed.spec.consumer_code
+                        fix_decisions = await self.nucleus.reason(
+                            f"My Flink SQL consumer '{cid}' (job {managed.flink_job_id}) is RUNNING "
+                            f"but has read 0 records after {settle_seconds}s.\n\n"
+                            f"Source topics: {managed.spec.source_topics}\n"
+                            f"Current SQL:\n```sql\n{current_sql}\n```\n\n"
+                            f"Possible causes:\n"
+                            f"- Wrong topic name in CREATE TABLE\n"
+                            f"- Wrong bootstrap server (must use 'kafka:29092' for Flink inside Docker)\n"
+                            f"- Schema mismatch (field names/types don't match the JSON events)\n"
+                            f"- Watermark is too strict (events arrive out of order)\n"
+                            f"- Source topic genuinely has no data yet\n\n"
+                            f"Use flink_inspect or flink_cluster to gather more info if needed. "
+                            f"If you can fix the SQL, call spawn_consumer with runtime='flink_sql' "
+                            f"and the corrected code. Keep consumer_id '{cid}'."
+                        )
+                        for decision in fix_decisions:
+                            action = decision.get("action", {})
+                            if action.get("type") == "spawn_consumer" and action.get("consumer_code"):
+                                action["consumer_id"] = cid
+                                action["runtime"] = "flink_sql"
+                                result = await self.replace_consumer(action)
+                                await self.nucleus._log(f"Fix result: {result}")
+                                summary["fixes"].append({
+                                    "consumer_id": cid,
+                                    "iteration": iteration + 1,
+                                    "error": "Flink job 0 records",
+                                    "result": result,
+                                })
+                                break
+                    else:
+                        await self.nucleus._log(
+                            f"Flink consumer '{cid}' healthy — RUNNING "
+                            f"({records_in} records in, {records_out} out)"
+                        )
+                    continue
+
+                # Python consumers: check DLQ for errors
                 dlq_entries = await CM.read_dlq(managed.dlq_topic, limit=5)
-                # Only care about recent errors (from this verification run)
                 recent_errors = [e for e in dlq_entries if e.get("error")]
 
                 if recent_errors and managed.errors > 0:
@@ -151,7 +473,6 @@ class AgentCell:
                     # Ask nucleus to diagnose and fix
                     await self.nucleus._log(f"Asking nucleus to fix '{cid}'...")
 
-                    # Build a focused prompt with the error details
                     error_details = json.dumps(recent_errors[-3:], indent=2, default=str)
                     current_code = managed.spec.consumer_code
 
@@ -164,11 +485,9 @@ class AgentCell:
                         f"IMPORTANT: Fix the root cause shown in the error, don't just add try/except."
                     )
 
-                    # Execute any spawn_consumer decisions as replacements
                     for decision in fix_decisions:
                         action = decision.get("action", {})
                         if action.get("type") == "spawn_consumer" and action.get("consumer_code"):
-                            # Treat as a replace
                             action["consumer_id"] = cid
                             result = await self.replace_consumer(action)
                             await self.nucleus._log(f"Fix result: {result}")
@@ -181,9 +500,51 @@ class AgentCell:
                             break
 
                 elif managed.events_processed == 0:
-                    # Warning only — don't trigger a fix attempt, the code may be fine
-                    # (wrong topic, consumer group lag, slow startup)
-                    await self.nucleus._log(f"Consumer '{cid}' has processed 0 events after {settle_seconds}s — waiting for data")
+                    all_healthy = False
+                    summary["errors_found"] += 1
+                    await self.nucleus._log(
+                        f"Consumer '{cid}' has processed 0 events after {settle_seconds}s — investigating..."
+                    )
+
+                    # Ask nucleus to diagnose: wrong topic? bad subscription? code error?
+                    current_code = managed.spec.consumer_code
+                    source_topics = managed.spec.source_topics
+
+                    # Sample source topics to check if data is flowing
+                    from src.cell.kafka_tools import topic_stats
+                    try:
+                        stats = await topic_stats(source_topics)
+                        topic_info = json.dumps(stats, indent=2, default=str)
+                    except Exception:
+                        topic_info = "(could not read topic stats)"
+
+                    fix_decisions = await self.nucleus.reason(
+                        f"My consumer '{cid}' has processed 0 events after {settle_seconds}s.\n\n"
+                        f"Source topics: {source_topics}\n"
+                        f"Topic stats:\n{topic_info}\n\n"
+                        f"Current code:\n```python\n{current_code}\n```\n\n"
+                        f"Diagnose the issue. Possible causes:\n"
+                        f"- Wrong topic name (check available topics above)\n"
+                        f"- Consumer code crashes before processing (check init())\n"
+                        f"- Topic exists but has no data yet (if stats show 0 messages)\n\n"
+                        f"If you can fix the issue, call spawn_consumer with corrected code. "
+                        f"Keep the same consumer_id '{cid}', source_topics, and output_topic. "
+                        f"If the topic simply has no data yet, say so and I'll retry."
+                    )
+
+                    for decision in fix_decisions:
+                        action = decision.get("action", {})
+                        if action.get("type") == "spawn_consumer" and action.get("consumer_code"):
+                            action["consumer_id"] = cid
+                            result = await self.replace_consumer(action)
+                            await self.nucleus._log(f"Fix result: {result}")
+                            summary["fixes"].append({
+                                "consumer_id": cid,
+                                "iteration": iteration + 1,
+                                "error": "0 events processed",
+                                "result": result,
+                            })
+                            break
 
                 else:
                     await self.nucleus._log(
@@ -223,12 +584,34 @@ class AgentCell:
 
         for entry in persisted:
             spec = entry["spec"]
+            persisted_job_id = entry.get("flink_job_id")
             try:
+                # For Flink consumers, check if the persisted job is still running
+                if spec.runtime == "flink_sql" and persisted_job_id:
+                    try:
+                        flink = self.consumer_manager._get_flink_runtime()
+                        status = flink.status(persisted_job_id)
+                        if status.get("state") == "RUNNING":
+                            # Job is still alive — reattach instead of resubmitting
+                            from src.cell.consumer import ManagedConsumer
+                            managed = ManagedConsumer(
+                                spec=spec, running=True, flink_job_id=persisted_job_id,
+                            )
+                            self.consumer_manager.consumers[spec.consumer_id] = managed
+                            managed.events_processed = entry.get("events_processed", 0)
+                            managed.alerts_emitted = entry.get("alerts_emitted", 0)
+                            print(f"  [{self.name}] Reattached Flink consumer '{spec.consumer_id}' → job {persisted_job_id} (RUNNING)")
+                            continue
+                    except Exception:
+                        print(f"  [{self.name}] Flink job {persisted_job_id} unreachable — resubmitting")
+
                 managed = self.consumer_manager.spawn(spec)
-                # Restore counters from before shutdown
                 managed.events_processed = entry.get("events_processed", 0)
                 managed.alerts_emitted = entry.get("alerts_emitted", 0)
-                print(f"  [{self.name}] Reloaded consumer '{spec.consumer_id}' ({managed.events_processed} prior events)")
+                if managed.flink_job_id:
+                    print(f"  [{self.name}] Reloaded Flink consumer '{spec.consumer_id}' → new job {managed.flink_job_id}")
+                else:
+                    print(f"  [{self.name}] Reloaded consumer '{spec.consumer_id}' ({managed.events_processed} prior events)")
             except Exception as e:
                 print(f"  [{self.name}] Failed to reload consumer '{spec.consumer_id}': {e}")
 
@@ -251,24 +634,39 @@ class AgentCell:
         print(f"[{self.name}] Cell destroyed")
 
     async def purge(self) -> list[str]:
-        """Stop and destroy ALL resources — Postgres schema, Kafka topics, registry entry.
+        """Stop and destroy ALL resources — Postgres schema, Kafka topics, Flink jobs, registry entry.
         Returns a log of what was purged."""
         purged = []
 
-        # Stop consumers
+        # Stop consumers — list each one individually
+        for managed in list(self.consumer_manager.consumers.values()):
+            cid = managed.spec.consumer_id
+
+            # Cancel Flink jobs
+            if managed.flink_job_id:
+                try:
+                    flink = self.consumer_manager._get_flink_runtime()
+                    flink.cancel(managed.flink_job_id)
+                    purged.append(f"Cancelled Flink job: {cid} (job_id={managed.flink_job_id})")
+                except Exception as e:
+                    purged.append(f"Could not cancel Flink job {cid} ({managed.flink_job_id}): {e}")
+            else:
+                purged.append(f"Stopped Python consumer: {cid}")
+
         if self.consumer_manager.consumers:
             self.consumer_manager.stop_all()
-            purged.append(f"Stopped {len(self.consumer_manager.consumers)} consumer(s)")
 
         self._decision_producer.flush(5)
 
-        # Drop Postgres schema (knowledge tables + any custom tables)
+        # Drop Postgres schema (knowledge tables + any custom tables) — list each table
         try:
             stats = self.knowledge.stats()
             table_names = list(stats.get("tables", {}).keys())
-            purged.append(f"Dropping schema {self.knowledge.schema} ({len(table_names)} tables: {', '.join(table_names)})")
+            for tname in table_names:
+                rows = stats["tables"][tname].get("rows", 0)
+                purged.append(f"Dropping table: {self.knowledge.schema}.{tname} ({rows} rows)")
         except Exception:
-            purged.append(f"Dropping schema {self.knowledge.schema}")
+            purged.append(f"Dropping schema: {self.knowledge.schema}")
         self.knowledge.destroy()
 
         # Delete Kafka topics (decision log + derived output topics)
@@ -331,15 +729,29 @@ class AgentCell:
         that need operator approval before deployment.
         """
         pending_actions = []
+        queued_consumers = set()  # track consumer IDs already queued in this chat turn
 
         async def _intercept_tool(tool_name: str, tool_input: dict) -> str:
             if tool_name in self.DEPLOYMENT_TOOLS:
+                consumer_id = tool_input.get("consumer_id", "")
+                action_key = f"{tool_name}:{consumer_id}"
+
+                # Reject duplicate actions on the same consumer in one chat turn
+                if action_key in queued_consumers:
+                    return (
+                        f"Already queued — {tool_name} for '{consumer_id}' is already pending operator approval. "
+                        f"Do NOT call {tool_name} again for the same consumer. Move on to your next task or "
+                        f"summarize what you've done."
+                    )
+                queued_consumers.add(action_key)
+
                 # Don't execute — stash for operator approval
                 pending_actions.append({"type": tool_name, **tool_input})
                 return (
                     f"Done — {tool_name} has been queued. The operator will be prompted to approve it "
                     f"and it will be deployed automatically if approved. Do NOT ask the operator to "
-                    f"confirm or deploy — that is handled by the system. Simply summarize what you changed and why."
+                    f"confirm or deploy — that is handled by the system. Do NOT call {tool_name} again "
+                    f"for '{consumer_id}'. Simply summarize what you changed and why."
                 )
             else:
                 # Read-only tools execute immediately
@@ -468,12 +880,35 @@ class AgentCell:
         except Exception:
             kb_stats = {"error": "Could not query knowledge base"}
 
+        consumers = self.consumer_manager.list_consumers()
+
+        # Enrich Flink consumers with live job status
+        flink_consumers = [m for m in self.consumer_manager.consumers.values() if m.flink_job_id]
+        if flink_consumers:
+            try:
+                flink = self.consumer_manager._get_flink_runtime()
+                for m in flink_consumers:
+                    for c in consumers:
+                        if c["consumer_id"] == m.spec.consumer_id:
+                            try:
+                                status = flink.status(m.flink_job_id)
+                                c["flink_status"] = status.get("state", "UNKNOWN")
+                                c["flink_duration_ms"] = status.get("duration")
+                                metrics = flink.job_metrics(m.flink_job_id)
+                                c["flink_records_in"] = metrics.get("total_read_records", 0)
+                                c["flink_records_out"] = metrics.get("total_write_records", 0)
+                            except Exception:
+                                c["flink_status"] = "UNREACHABLE"
+                            break
+            except Exception:
+                pass
+
         return {
             "cell_id": self.cell_id,
             "name": self.name,
             "directive": self.directive,
             "status": self.status.value,
-            "consumers": self.consumer_manager.list_consumers(),
+            "consumers": consumers,
             "events_processed": self.consumer_manager.total_events(),
             "knowledge_base": kb_stats,
             "decision_topic": self.decision_topic,
@@ -492,6 +927,7 @@ class AgentCell:
             description=action.get("description", ""),
             detection_patterns=action.get("detection_patterns", []),
             knowledge_tables=action.get("knowledge_tables", []),
+            runtime=action.get("runtime", "python"),
         )
 
     async def replace_consumer(self, action: dict) -> str:
@@ -501,6 +937,7 @@ class AgentCell:
         if old is None:
             return f"Consumer '{consumer_id}' not found"
 
+        runtime = action.get("runtime", old.spec.runtime)
         new_spec = ConsumerSpec(
             consumer_id=consumer_id,
             source_topics=old.spec.source_topics,
@@ -509,20 +946,25 @@ class AgentCell:
             description=action.get("description", old.spec.description),
             detection_patterns=action.get("detection_patterns", old.spec.detection_patterns),
             knowledge_tables=action.get("knowledge_tables", old.spec.knowledge_tables),
+            runtime=runtime,
         )
 
-        # Validate new code compiles BEFORE touching the old consumer
-        from src.cell.consumer import _compile_consumer_code
-        try:
-            _compile_consumer_code(new_spec.consumer_code)
-        except Exception as e:
-            return f"New code failed to compile — old consumer kept running. Error: {e}"
+        # Validate before touching the old consumer
+        if runtime == "flink_sql":
+            # Basic SQL validation — check it has an INSERT INTO
+            if "INSERT INTO" not in new_spec.consumer_code.upper():
+                return "Flink SQL must include an INSERT INTO statement — old consumer kept running."
+        else:
+            from src.cell.consumer import _compile_consumer_code
+            try:
+                _compile_consumer_code(new_spec.consumer_code)
+            except Exception as e:
+                return f"New code failed to compile — old consumer kept running. Error: {e}"
 
-        # Stop old consumer and wait for the thread to actually finish
-        old.running = False  # signal the thread loop to exit
+        # Stop old consumer
+        old.running = False
         self.consumer_manager.stop(consumer_id)
         if old.task:
-            # Wait longer — the thread needs time to exit poll() and close the Kafka consumer
             for _ in range(20):  # up to 10 seconds
                 if old.task.done():
                     break
@@ -545,17 +987,67 @@ class AgentCell:
             managed.alerts_emitted = prior_alerts
             self._persist_consumers()
 
-            # Stability check — wait up to 5 seconds, verify consumer is still alive
-            # and hasn't immediately crashed on first events
-            for _ in range(10):
-                await asyncio.sleep(0.5)
-                if not managed.running:
+            # Stability check
+            if managed.flink_job_id:
+                # Flink: poll job status until RUNNING or terminal, up to 30 seconds
+                flink = self.consumer_manager._get_flink_runtime()
+                stable = False
+                last_state = "UNKNOWN"
+                for attempt in range(15):
+                    await asyncio.sleep(2)
+                    try:
+                        status = flink.status(managed.flink_job_id)
+                        last_state = status.get("state", "UNKNOWN")
+                    except Exception as e:
+                        if attempt < 3:
+                            continue  # Flink may not have registered the job yet
+                        return f"Could not verify Flink job status after {attempt * 2}s: {e}"
+
+                    if last_state == "RUNNING":
+                        # Job is running — wait a bit more then check it's still stable
+                        await asyncio.sleep(3)
+                        try:
+                            recheck = flink.status(managed.flink_job_id)
+                            if recheck.get("state") == "RUNNING":
+                                stable = True
+                                break
+                            last_state = recheck.get("state", "UNKNOWN")
+                        except Exception:
+                            stable = True  # optimistic — it was RUNNING
+                            break
+
+                    if last_state in ("FAILED", "CANCELED", "FINISHED"):
+                        # Fetch exception details for the error message
+                        error_detail = ""
+                        try:
+                            exc = flink.job_exceptions(managed.flink_job_id)
+                            root = exc.get("root_exception", "")
+                            if root:
+                                error_detail = f" Root cause: {root[:200]}"
+                        except Exception:
+                            pass
+                        managed.running = False
+                        return (
+                            f"Flink job '{consumer_id}' reached {last_state} after replace.{error_detail} "
+                            f"Use flink_inspect to see full details."
+                        )
+
+                if not stable:
                     return (
-                        f"Consumer '{consumer_id}' crashed shortly after starting. "
-                        f"Errors: {managed.errors}. Check the DLQ topic '{managed.dlq_topic}' for details."
+                        f"Flink job '{consumer_id}' still in state {last_state} after 30s. "
+                        f"Use flink_job_status to monitor progress."
                     )
-                if managed.events_processed > prior_events:
-                    break  # processing events successfully
+            else:
+                # Python: wait up to 5 seconds, verify consumer is still alive
+                for _ in range(10):
+                    await asyncio.sleep(0.5)
+                    if not managed.running:
+                        return (
+                            f"Consumer '{consumer_id}' crashed shortly after starting. "
+                            f"Errors: {managed.errors}. Check the DLQ topic '{managed.dlq_topic}' for details."
+                        )
+                    if managed.events_processed > prior_events:
+                        break
 
             self._log_decision({
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -565,6 +1057,16 @@ class AgentCell:
                 "action": {"type": "replace_consumer", **action},
             })
 
+            if managed.flink_job_id:
+                try:
+                    metrics = flink.job_metrics(managed.flink_job_id)
+                    records = metrics.get("total_read_records", 0)
+                    return (
+                        f"Consumer '{consumer_id}' replaced — Flink job {managed.flink_job_id} stable and RUNNING"
+                        f" ({records} records read so far)"
+                    )
+                except Exception:
+                    return f"Consumer '{consumer_id}' replaced — Flink job {managed.flink_job_id} stable and RUNNING"
             if managed.events_processed > prior_events:
                 return f"Consumer '{consumer_id}' replaced and stable ({managed.events_processed - prior_events} events processed)"
             return f"Consumer '{consumer_id}' replaced and running (awaiting first events)"
@@ -581,9 +1083,47 @@ class AgentCell:
     async def add_consumer(self, spec: ConsumerSpec) -> str:
         """Add a new consumer from a spec."""
         try:
-            self.consumer_manager.spawn(spec)
+            managed = self.consumer_manager.spawn(spec)
             self._persist_consumers()
             self._update_registry()
+
+            # Stabilization for Flink jobs
+            if managed.flink_job_id:
+                flink = self.consumer_manager._get_flink_runtime()
+                for attempt in range(15):
+                    await asyncio.sleep(2)
+                    try:
+                        status = flink.status(managed.flink_job_id)
+                        state = status.get("state", "UNKNOWN")
+                    except Exception:
+                        if attempt < 3:
+                            continue
+                        return f"Consumer '{spec.consumer_id}' submitted but could not verify Flink job status"
+
+                    if state == "RUNNING":
+                        await asyncio.sleep(3)
+                        try:
+                            recheck = flink.status(managed.flink_job_id)
+                            if recheck.get("state") == "RUNNING":
+                                return f"Consumer '{spec.consumer_id}' — Flink job {managed.flink_job_id} stable and RUNNING"
+                        except Exception:
+                            pass
+                        return f"Consumer '{spec.consumer_id}' — Flink job {managed.flink_job_id} RUNNING"
+
+                    if state in ("FAILED", "CANCELED", "FINISHED"):
+                        error_detail = ""
+                        try:
+                            exc = flink.job_exceptions(managed.flink_job_id)
+                            root = exc.get("root_exception", "")
+                            if root:
+                                error_detail = f" Root cause: {root[:200]}"
+                        except Exception:
+                            pass
+                        managed.running = False
+                        return f"Flink job '{spec.consumer_id}' {state}.{error_detail}"
+
+                return f"Consumer '{spec.consumer_id}' submitted — Flink job still initializing after 30s"
+
             return f"Consumer '{spec.consumer_id}' spawned"
         except Exception as e:
             return f"Failed to spawn consumer: {e}"
@@ -619,6 +1159,66 @@ class AgentCell:
             from src.cell.kafka_tools import topic_stats
             stats = await topic_stats(tool_input.get("topics"))
             return json.dumps(stats, indent=2, default=str)
+        elif tool_name == "flink_job_status":
+            consumer_id = tool_input.get("consumer_id")
+            results = []
+            targets = []
+            if consumer_id:
+                managed = self.consumer_manager.consumers.get(consumer_id)
+                if not managed:
+                    return f"Consumer '{consumer_id}' not found"
+                if not managed.flink_job_id:
+                    return f"Consumer '{consumer_id}' is a Python consumer, not Flink SQL"
+                targets = [managed]
+            else:
+                targets = [m for m in self.consumer_manager.consumers.values() if m.flink_job_id]
+            if not targets:
+                return "No Flink SQL consumers found"
+            flink = self.consumer_manager._get_flink_runtime()
+            for m in targets:
+                try:
+                    status = flink.status(m.flink_job_id)
+                    results.append({
+                        "consumer_id": m.spec.consumer_id,
+                        "flink_job_id": m.flink_job_id,
+                        **status,
+                    })
+                except Exception as e:
+                    results.append({
+                        "consumer_id": m.spec.consumer_id,
+                        "flink_job_id": m.flink_job_id,
+                        "error": str(e),
+                    })
+            return json.dumps(results, indent=2, default=str)
+        elif tool_name == "flink_inspect":
+            consumer_id = tool_input["consumer_id"]
+            managed = self.consumer_manager.consumers.get(consumer_id)
+            if not managed:
+                return f"Consumer '{consumer_id}' not found"
+            if not managed.flink_job_id:
+                return f"Consumer '{consumer_id}' is a Python consumer, not Flink SQL"
+            flink = self.consumer_manager._get_flink_runtime()
+            include = tool_input.get("include", "all")
+            result = {}
+            try:
+                if include in ("details", "all"):
+                    result["details"] = flink.job_details(managed.flink_job_id)
+                if include in ("exceptions", "all"):
+                    result["exceptions"] = flink.job_exceptions(managed.flink_job_id)
+                if include in ("metrics", "all"):
+                    result["metrics"] = flink.job_metrics(managed.flink_job_id)
+                if include not in ("details", "exceptions", "metrics", "all"):
+                    result["details"] = flink.job_details(managed.flink_job_id)
+            except Exception as e:
+                return f"Error inspecting Flink job {managed.flink_job_id}: {e}"
+            return json.dumps(result, indent=2, default=str)
+        elif tool_name == "flink_cluster":
+            try:
+                flink = self.consumer_manager._get_flink_runtime()
+                overview = flink.cluster_overview()
+                return json.dumps(overview, indent=2, default=str)
+            except Exception as e:
+                return f"Error reaching Flink cluster: {e}"
         elif tool_name == "inspect_dlq":
             consumer_id = tool_input.get("consumer_id")
             limit = tool_input.get("limit", 10)
@@ -681,7 +1281,10 @@ class AgentCell:
     # --- Decision & persistence ---
 
     async def _execute_decision(self, decision: dict):
-        """Execute a decision from the nucleus."""
+        """Execute a decision from the nucleus.
+
+        Raises on spawn failure so the caller can handle it (e.g., report to CLI).
+        """
         self._log_decision(decision)
         action = decision.get("action", {})
         action_type = action.get("type")
@@ -690,11 +1293,13 @@ class AgentCell:
             spec = self._spec_from_action(action)
             if not spec.consumer_id:
                 spec.consumer_id = f"consumer-{len(self.consumer_manager.consumers)}"
-            try:
-                self.consumer_manager.spawn(spec)
-                self._update_registry()
-            except Exception as e:
-                print(f"  [{self.name}] Failed to spawn consumer: {e}")
+            managed = self.consumer_manager.spawn(spec)
+            self._persist_consumers()
+            self._update_registry()
+            if managed.flink_job_id:
+                print(f"  [{self.name}] Spawned Flink consumer '{spec.consumer_id}' → job {managed.flink_job_id}")
+            else:
+                print(f"  [{self.name}] Spawned Python consumer '{spec.consumer_id}'")
 
         elif action_type == "store_knowledge":
             self.knowledge.store(
@@ -715,13 +1320,37 @@ class AgentCell:
     def _build_context(self) -> str:
         consumers = self.consumer_manager.list_consumers(include_code=False)
         total = self.consumer_manager.total_events()
+
+        # Enrich Flink consumers with live job status
+        flink_consumers = [m for m in self.consumer_manager.consumers.values() if m.flink_job_id]
+        if flink_consumers:
+            try:
+                flink = self.consumer_manager._get_flink_runtime()
+                for m in flink_consumers:
+                    try:
+                        status = flink.status(m.flink_job_id)
+                        # Find the matching consumer dict and add status
+                        for c in consumers:
+                            if c["consumer_id"] == m.spec.consumer_id:
+                                c["flink_status"] = status.get("state", "UNKNOWN")
+                                c["flink_duration_ms"] = status.get("duration")
+                                break
+                    except Exception:
+                        for c in consumers:
+                            if c["consumer_id"] == m.spec.consumer_id:
+                                c["flink_status"] = "UNREACHABLE"
+                                break
+            except Exception:
+                pass
+
         return f"""Active consumers: {len(consumers)}
 Total events processed: {total}
 Consumers: {json.dumps(consumers, indent=2)}
 Cell status: {self.status.value}
 
 To answer questions about what your consumers do, use the descriptions and detection_patterns above.
-To view actual code, use get_consumer_code. To inspect your knowledge base, use describe_schema and query_knowledge."""
+To view actual code, use get_consumer_code. To inspect your knowledge base, use describe_schema and query_knowledge.
+For Flink SQL consumers, use flink_job_status to check job health. Use replace_consumer to update Flink SQL."""
 
     # --- Postgres persistence ---
 
@@ -729,7 +1358,7 @@ To view actual code, use get_consumer_code. To inspect your knowledge base, use 
         """Save all consumer specs + stats to Postgres for reload."""
         specs = []
         for managed in self.consumer_manager.consumers.values():
-            specs.append({
+            entry = {
                 "consumer_id": managed.spec.consumer_id,
                 "source_topics": managed.spec.source_topics,
                 "output_topic": managed.spec.output_topic,
@@ -737,9 +1366,13 @@ To view actual code, use get_consumer_code. To inspect your knowledge base, use 
                 "description": managed.spec.description,
                 "detection_patterns": managed.spec.detection_patterns,
                 "knowledge_tables": managed.spec.knowledge_tables,
+                "runtime": managed.spec.runtime,
                 "events_processed": managed.events_processed,
                 "alerts_emitted": managed.alerts_emitted,
-            })
+            }
+            if managed.flink_job_id:
+                entry["flink_job_id"] = managed.flink_job_id
+            specs.append(entry)
         with psycopg.connect(POSTGRES_URL) as conn:
             conn.execute(
                 "UPDATE public.cells SET consumers = %s WHERE cell_id = %s",
@@ -767,9 +1400,11 @@ To view actual code, use get_consumer_code. To inspect your knowledge base, use 
                         description=s.get("description", ""),
                         detection_patterns=s.get("detection_patterns", []),
                         knowledge_tables=s.get("knowledge_tables", []),
+                        runtime=s.get("runtime", "python"),
                     ),
                     "events_processed": s.get("events_processed", 0),
                     "alerts_emitted": s.get("alerts_emitted", 0),
+                    "flink_job_id": s.get("flink_job_id"),
                 })
         return results
 

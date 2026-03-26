@@ -42,13 +42,13 @@ async def run_device_producer(scheduler: AnomalyScheduler):
                     for s in states:
                         if s.info["device_id"] == device_id:
                             s.config_changed = True
-                            s.last_config_change = datetime.now(timezone.utc).isoformat()
+                            s.last_config_change = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
             # Emit status for all devices
             for state in states:
                 state.tick()
                 event = {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
                     "device_id": state.info["device_id"],
                     "device_type": state.info["device_type"],
                     "manufacturer": state.info["manufacturer"],
