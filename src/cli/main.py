@@ -98,72 +98,83 @@ def _print_events(events: list[str]):
 
 
 def _print_topology(consumers: list[dict], cell_name: str):
-    """Print a visual topology diagram of the consumer pipeline."""
+    """Print a visual topology diagram showing the full data flow graph."""
     if not consumers:
         return
 
-    # Collect all source topics, intermediate topics, and output topics
-    source_topics = set()
-    output_topics = set()
-    consumer_outputs = {}  # consumer_id -> output_topic
-
+    # Build lookup maps
+    output_to_consumer = {}  # topic -> consumer that produces it
+    consumer_by_id = {}
     for c in consumers:
-        for t in c.get("source_topics", []):
-            source_topics.add(t)
+        consumer_by_id[c["consumer_id"]] = c
         out = c.get("output_topic", "")
         if out:
-            output_topics.add(out)
-            consumer_outputs[c["consumer_id"]] = out
+            output_to_consumer[out] = c["consumer_id"]
 
-    # Intermediate topics: output of one consumer that's input to another
+    # Identify topic types
+    all_outputs = set(output_to_consumer.keys())
     all_inputs = set()
     for c in consumers:
         all_inputs.update(c.get("source_topics", []))
-    intermediate = output_topics & all_inputs
+    intermediate = all_outputs & all_inputs  # produced by one consumer, consumed by another
+    external_sources = all_inputs - all_outputs  # not produced by any consumer (Kafka source topics)
+    final_outputs = all_outputs - all_inputs  # not consumed by any consumer (terminal output)
 
-    # Build topology lines
+    # Build lines
     lines = []
     lines.append(f"[bold]Consumer Topology[/] — {cell_name}")
     lines.append("")
 
-    # Group: Flink consumers first, then Python
-    flink = [c for c in consumers if c.get("runtime") == "flink_sql"]
-    python = [c for c in consumers if c.get("runtime", "python") != "flink_sql"]
-
-    def _format_consumer(c):
-        cid = c["consumer_id"]
-        runtime = c.get("runtime", "python")
-        inputs = ", ".join(c.get("source_topics", []))
-        output = c.get("output_topic", "?")
-        tag = "[magenta]Flink[/]" if runtime == "flink_sql" else "[blue]Python[/]"
-        return cid, tag, inputs, output
-
-    if flink:
-        lines.append("  [dim]── Data Processing Layer (Flink SQL) ──[/]")
-        for c in flink:
-            cid, tag, inputs, output = _format_consumer(c)
-            lines.append(f"    {inputs}")
-            lines.append(f"      └─→ {tag} [cyan]{cid}[/]")
-            if output in intermediate:
-                lines.append(f"            └─→ [yellow]{output}[/] [dim](derived)[/]")
-            else:
-                lines.append(f"            └─→ [green]{output}[/]")
+    # Show external source topics
+    if external_sources:
+        lines.append("  [dim]Source Topics (external)[/]")
+        for t in sorted(external_sources):
+            lines.append(f"    [dim]◆[/] {t}")
         lines.append("")
 
-    if python:
-        lines.append("  [dim]── Intelligence Layer (Python) ──[/]")
-        for c in python:
-            cid, tag, inputs, output = _format_consumer(c)
-            # Highlight if reading from a Flink-produced topic
-            input_parts = []
-            for t in c.get("source_topics", []):
-                if t in intermediate:
-                    input_parts.append(f"[yellow]{t}[/] [dim](from Flink)[/]")
-                else:
-                    input_parts.append(t)
-            lines.append(f"    {', '.join(input_parts)}")
-            lines.append(f"      └─→ {tag} [cyan]{cid}[/]")
-            lines.append(f"            └─→ [green]{output}[/] + [dim]pgvector knowledge[/]")
+    # Show each consumer as a node with its connections
+    lines.append("  [dim]Consumers[/]")
+    for c in consumers:
+        cid = c["consumer_id"]
+        runtime = c.get("runtime", "python")
+        tag = "[magenta]flink[/]" if runtime == "flink_sql" else "[blue]python[/]"
+        output = c.get("output_topic", "")
+
+        # Input connections
+        for t in c.get("source_topics", []):
+            producer = output_to_consumer.get(t)
+            if producer:
+                lines.append(f"    [yellow]{t}[/] [dim](from {producer})[/]")
+            else:
+                lines.append(f"    {t}")
+            lines.append(f"      │")
+
+        # Consumer node
+        lines.append(f"      ├─→ {tag} [cyan]{cid}[/]")
+
+        # Output connection
+        if output:
+            if output in intermediate:
+                lines.append(f"      │     └─→ [yellow]{output}[/] [dim](derived → consumed below)[/]")
+            elif output in final_outputs:
+                suffix = " + [dim]pgvector[/]" if runtime != "flink_sql" else ""
+                lines.append(f"      │     └─→ [green]{output}[/]{suffix}")
+            else:
+                lines.append(f"      │     └─→ {output}")
+        lines.append("")
+
+    # Warn about Flink outputs that no consumer subscribes to — likely a wiring gap
+    flink_outputs_unconsumed = []
+    for c in consumers:
+        if c.get("runtime") == "flink_sql":
+            out = c.get("output_topic", "")
+            if out and out not in all_inputs:
+                flink_outputs_unconsumed.append((out, c["consumer_id"]))
+
+    if flink_outputs_unconsumed:
+        lines.append("  [bold yellow]Warning: Flink output topics not consumed by any consumer:[/]")
+        for topic, producer in flink_outputs_unconsumed:
+            lines.append(f"    [yellow]⚠ {topic}[/] [dim](produced by {producer} but no consumer subscribes to it)[/]")
         lines.append("")
 
     console.print(Panel("\n".join(lines), border_style="dim"))
