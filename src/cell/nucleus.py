@@ -429,6 +429,70 @@ CHAT_TOOLS = [
             "required": ["title", "description", "panels"],
         },
     },
+    {
+        "name": "inspect_dashboard",
+        "description": (
+            "Inspect one of my dashboards to see panel details, queries, and error states. "
+            "Use this to diagnose why a dashboard panel isn't working correctly."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dashboard_id": {"type": "string", "description": "Dashboard ID (from create_dashboard result or list)"},
+            },
+            "required": ["dashboard_id"],
+        },
+    },
+    {
+        "name": "update_dashboard_panel",
+        "description": (
+            "Fix or update a panel in one of my dashboards. Use this when a panel has errors "
+            "(wrong SQL query, bad column names, wrong chart type) or needs improvement. "
+            "The panel updates live — connected browsers see the fix immediately."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dashboard_id": {"type": "string"},
+                "panel_id": {"type": "string", "description": "ID of the panel to update"},
+                "updates": {
+                    "type": "object",
+                    "description": "Fields to update. Any of: query (SQL), chart_type, title, config, refresh_seconds",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "chart_type": {"type": "string", "enum": ["line", "bar", "table", "stat"]},
+                        "title": {"type": "string"},
+                        "config": {"type": "object"},
+                        "refresh_seconds": {"type": "integer"},
+                    },
+                },
+            },
+            "required": ["dashboard_id", "panel_id", "updates"],
+        },
+    },
+    {
+        "name": "add_dashboard_panel",
+        "description": "Add a new panel to an existing dashboard.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dashboard_id": {"type": "string"},
+                "panel": {
+                    "type": "object",
+                    "properties": {
+                        "panel_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "chart_type": {"type": "string", "enum": ["line", "bar", "table", "stat"]},
+                        "query": {"type": "string"},
+                        "refresh_seconds": {"type": "integer"},
+                        "config": {"type": "object"},
+                    },
+                    "required": ["panel_id", "title", "chart_type", "query"],
+                },
+            },
+            "required": ["dashboard_id", "panel"],
+        },
+    },
 ]
 
 
@@ -580,6 +644,18 @@ MODIFYING MY CONSUMERS:
 3. Only then use get_consumer_code to retrieve the current code, author the updated version, and call replace_consumer.
 4. Code changes are NOT deployed immediately — they are presented to the operator for review and approval.
 
+KNOWLEDGE PERSISTENCE — CRITICAL:
+After every significant decision (spawning a consumer, choosing detection thresholds, selecting topics,
+designing a detection strategy), I MUST call **store_knowledge** to record:
+- WHAT I decided and WHY (the rationale, trade-offs considered, alternatives rejected)
+- The detection strategy and threshold choices for each consumer
+- How my consumers relate to each other and to my directive
+
+The Kafka decision log is an automatic audit trail for external meta-analysis only — I cannot read it.
+My knowledge base is MY memory. If I don't store_knowledge, I will forget why I made a decision.
+I should store_knowledge at least once per spawn_consumer call, summarizing the consumer's purpose
+and the reasoning behind its design.
+
 CONSUMER CODE CAPABILITIES:
 My authored consumer code has three capabilities:
 - **state** (dict) — In-memory state for windows, counters, rolling stats. Fast but lost on restart.
@@ -672,6 +748,40 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
                     self._log_to_kafka("decision", reasoning_decision)
                 break
 
+            # Auto-persist knowledge for spawn_consumer decisions (fallback
+            # in case the model doesn't call store_knowledge itself)
+            model_stored_consumers = {
+                block.input.get("metadata", {}).get("consumer_id")
+                or block.input.get("content", "")
+                for block in tool_uses
+                if block.name == "store_knowledge"
+            }
+            for block in tool_uses:
+                if block.name == "spawn_consumer":
+                    consumer_id = block.input.get("consumer_id", "")
+                    # Skip if the model already stored knowledge mentioning this consumer
+                    if consumer_id and any(consumer_id in s for s in model_stored_consumers):
+                        await self._log(f"Skipping auto-store for '{consumer_id}' — model already stored knowledge")
+                        continue
+                    inp = block.input
+                    summary = (
+                        f"Consumer '{consumer_id}': {inp.get('description', 'no description')}. "
+                        f"Topics: {', '.join(inp.get('source_topics', []))} → {inp.get('output_topic', '?')}. "
+                        f"Detects: {', '.join(inp.get('detection_patterns', []))}. "
+                        f"Tables: {', '.join(inp.get('knowledge_tables', []))}."
+                    )
+                    reasoning = " ".join(text_parts).strip()
+                    if reasoning:
+                        summary += f" Rationale: {reasoning[:500]}"
+                    try:
+                        self.knowledge.store(summary, "design_rationale", {
+                            "consumer_id": consumer_id,
+                            "auto_stored": True,
+                        })
+                        await self._log(f"Auto-stored knowledge for consumer '{consumer_id}'")
+                    except Exception as e:
+                        await self._log(f"Failed to auto-store knowledge: {e}")
+
             # Feed back tool results so the model can continue
             messages.append({"role": "assistant", "content": response.content})
             tool_results = []
@@ -752,7 +862,7 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
             return f"Error: {e}"
 
     # Side-effect tools that modify consumers
-    SIDE_EFFECT_TOOLS = {"get_consumer_code", "replace_consumer", "spawn_consumer", "remove_consumer", "create_dashboard", "inspect_dlq", "sample_topic", "topic_stats"}
+    SIDE_EFFECT_TOOLS = {"get_consumer_code", "replace_consumer", "spawn_consumer", "remove_consumer", "create_dashboard", "inspect_dashboard", "update_dashboard_panel", "add_dashboard_panel", "inspect_dlq", "sample_topic", "topic_stats"}
 
     async def chat(self, user_message: str, context: str = "", on_tool_action: callable = None) -> str:
         """Interactive chat with the operator.

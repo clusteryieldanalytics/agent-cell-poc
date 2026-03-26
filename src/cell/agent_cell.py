@@ -336,7 +336,11 @@ class AgentCell:
             if tool_name in self.DEPLOYMENT_TOOLS:
                 # Don't execute — stash for operator approval
                 pending_actions.append({"type": tool_name, **tool_input})
-                return f"Acknowledged — {tool_name} will be presented to the operator for approval before deployment."
+                return (
+                    f"Done — {tool_name} has been queued. The operator will be prompted to approve it "
+                    f"and it will be deployed automatically if approved. Do NOT ask the operator to "
+                    f"confirm or deploy — that is handled by the system. Simply summarize what you changed and why."
+                )
             else:
                 # Read-only tools execute immediately
                 return await self._handle_chat_tool_action(tool_name, tool_input)
@@ -355,6 +359,106 @@ class AgentCell:
         elif tool_name == "remove_consumer":
             return await self.remove_consumer(action["consumer_id"])
         return f"Unknown action: {tool_name}"
+
+    async def self_audit(self) -> dict:
+        """Periodic self-audit: ask the nucleus to review consumer health and DLQ errors.
+
+        The nucleus can use its chat tools (inspect_dlq, query_knowledge, get_consumer_code,
+        replace_consumer, etc.) to diagnose and fix issues autonomously.
+
+        Returns a summary dict with audit findings and any actions taken.
+        """
+        if self.status != CellStatus.ACTIVE:
+            return {"skipped": True, "reason": f"cell status is {self.status.value}"}
+
+        if not self.consumer_manager.consumers:
+            return {"skipped": True, "reason": "no consumers"}
+
+        # Build a health snapshot for the nucleus
+        consumer_health = []
+        for managed in self.consumer_manager.consumers.values():
+            cid = managed.spec.consumer_id
+            health = {
+                "consumer_id": cid,
+                "running": managed.running,
+                "events_processed": managed.events_processed,
+                "alerts_emitted": managed.alerts_emitted,
+                "errors": managed.errors,
+            }
+
+            # Read recent DLQ entries
+            try:
+                dlq_entries = await ConsumerManager.read_dlq(managed.dlq_topic, limit=5)
+                if dlq_entries:
+                    health["recent_dlq_errors"] = [
+                        {
+                            "error_type": e.get("error_type", "?"),
+                            "error": e.get("error", "?")[:200],
+                            "timestamp": e.get("timestamp", "?"),
+                        }
+                        for e in dlq_entries
+                    ]
+            except Exception:
+                pass
+
+            consumer_health.append(health)
+
+        audit_prompt = (
+            "SELF-AUDIT: Review your consumers' health and determine if any need tuning or fixes.\n\n"
+            f"Consumer health snapshot:\n{json.dumps(consumer_health, indent=2)}\n\n"
+            "For each consumer:\n"
+            "1. If it has DLQ errors, inspect the DLQ and fix the root cause\n"
+            "2. If it's not running, investigate why and respawn if needed\n"
+            "3. If it has low alert rates relative to events processed, consider whether thresholds need tuning\n"
+            "4. If everything looks healthy, say so briefly\n\n"
+            "Use inspect_dlq, get_consumer_code, and replace_consumer as needed. "
+            "Be conservative — only change code if there's a clear problem."
+        )
+
+        print(f"[{self.name}] Starting self-audit...")
+        actions_applied = []
+
+        async def _handle_audit_tool(tool_name: str, tool_input: dict) -> str:
+            """During self-audit, deployment tools execute directly (no operator approval)."""
+            if tool_name in self.DEPLOYMENT_TOOLS:
+                try:
+                    result = await self.deploy_action({"type": tool_name, **tool_input})
+                    actions_applied.append({"type": tool_name, **tool_input, "result": result})
+                    return result
+                except Exception as e:
+                    return f"Error: {e}"
+            else:
+                return await self._handle_chat_tool_action(tool_name, tool_input)
+
+        context = self._build_context()
+        reply = await self.nucleus.chat(audit_prompt, context, on_tool_action=_handle_audit_tool)
+
+        # Store the audit result in knowledge base
+        try:
+            self.knowledge.store(
+                f"Self-audit result: {reply[:500]}",
+                "design_rationale",
+                {"audit": True, "actions_applied": len(actions_applied)},
+            )
+        except Exception:
+            pass
+
+        self._log_decision({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "cell_id": self.cell_id,
+            "decision_type": "self_audit",
+            "reasoning": reply[:500],
+            "action": {"type": "self_audit", "actions_applied": actions_applied},
+        })
+
+        summary = {
+            "cell_name": self.name,
+            "reply": reply,
+            "actions_applied": actions_applied,
+            "consumers_audited": len(consumer_health),
+        }
+        print(f"[{self.name}] Self-audit complete — {len(actions_applied)} action(s) applied")
+        return summary
 
     def inspect(self) -> dict:
         """Return full cell state for inspection."""
@@ -440,6 +544,19 @@ class AgentCell:
             managed.events_processed = prior_events
             managed.alerts_emitted = prior_alerts
             self._persist_consumers()
+
+            # Stability check — wait up to 5 seconds, verify consumer is still alive
+            # and hasn't immediately crashed on first events
+            for _ in range(10):
+                await asyncio.sleep(0.5)
+                if not managed.running:
+                    return (
+                        f"Consumer '{consumer_id}' crashed shortly after starting. "
+                        f"Errors: {managed.errors}. Check the DLQ topic '{managed.dlq_topic}' for details."
+                    )
+                if managed.events_processed > prior_events:
+                    break  # processing events successfully
+
             self._log_decision({
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "cell_id": self.cell_id,
@@ -447,7 +564,10 @@ class AgentCell:
                 "reasoning": "Consumer code updated via interactive refinement",
                 "action": {"type": "replace_consumer", **action},
             })
-            return f"Consumer '{consumer_id}' replaced and running"
+
+            if managed.events_processed > prior_events:
+                return f"Consumer '{consumer_id}' replaced and stable ({managed.events_processed - prior_events} events processed)"
+            return f"Consumer '{consumer_id}' replaced and running (awaiting first events)"
         except Exception as e:
             # Spawn failed after stopping old — try to restore the old consumer
             try:
@@ -532,6 +652,30 @@ class AgentCell:
             )
             url = f"http://localhost:3000/dashboard/{dashboard.dashboard_id}"
             return f"Dashboard created: {url} ({len(dashboard.panels)} panels)"
+        elif tool_name == "inspect_dashboard":
+            if not self.dashboard_registry:
+                return "Dashboard server not available"
+            detail = self.dashboard_registry.get_detail(tool_input["dashboard_id"])
+            if not detail:
+                return f"Dashboard '{tool_input['dashboard_id']}' not found"
+            return json.dumps(detail, indent=2, default=str)
+        elif tool_name == "update_dashboard_panel":
+            if not self.dashboard_registry:
+                return "Dashboard server not available"
+            result = self.dashboard_registry.update_panel(
+                tool_input["dashboard_id"],
+                tool_input["panel_id"],
+                tool_input["updates"],
+            )
+            return result
+        elif tool_name == "add_dashboard_panel":
+            if not self.dashboard_registry:
+                return "Dashboard server not available"
+            result = self.dashboard_registry.add_panel(
+                tool_input["dashboard_id"],
+                tool_input["panel"],
+            )
+            return result
         return None
 
     # --- Decision & persistence ---

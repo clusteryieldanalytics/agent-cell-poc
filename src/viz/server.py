@@ -104,7 +104,9 @@ class VizServer:
                     "data": data,
                     "config": panel.config,
                 })
+                self.registry.record_panel_success(dashboard.dashboard_id, panel.panel_id)
             except Exception as e:
+                self.registry.record_panel_error(dashboard.dashboard_id, panel.panel_id, str(e))
                 await ws.send_json({
                     "panel_id": panel.panel_id,
                     "error": str(e),
