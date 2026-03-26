@@ -8,7 +8,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 POSTGRES_URL = os.getenv("POSTGRES_URL", "postgresql://agentcell:agentcell@localhost:5432/agentcell")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 # Kafka source topics
 TOPIC_FLOWS = "network.flows"
@@ -25,6 +25,9 @@ FLOW_EVENTS_PER_SECOND = 50
 DEVICE_POLL_INTERVAL_SECONDS = 30
 SYSLOG_EVENTS_PER_SECOND = 20
 ANOMALY_INTERVAL_RANGE = (120, 300)  # 2-5 minutes
+
+# Self-audit: periodic autonomous review of consumer health and tuning (0 = disabled)
+SELF_AUDIT_INTERVAL_SECONDS = int(os.getenv("SELF_AUDIT_INTERVAL_SECONDS", "0"))
 
 # Network simulation
 VLANS = {100: "corporate", 200: "servers", 300: "iot_guest"}

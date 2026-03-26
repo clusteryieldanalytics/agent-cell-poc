@@ -20,6 +20,7 @@ import traceback
 from datetime import datetime, timezone
 
 from src.cell.orchestrator import CellOrchestrator
+from src.config import SELF_AUDIT_INTERVAL_SECONDS
 from src.viz.dashboard import DashboardRegistry
 from src.viz.server import VizServer
 
@@ -40,6 +41,7 @@ class CellServer:
         )
         self._server = None
         self._started_at = datetime.now(timezone.utc)
+        self._audit_task: asyncio.Task | None = None
 
     def _get_knowledge_store(self, cell_id: str):
         """Look up a cell's knowledge store by cell_id."""
@@ -318,6 +320,14 @@ class CellServer:
             limit=1 << 20,  # 1MB readline buffer
         )
 
+        # Start self-audit loop if configured
+        if SELF_AUDIT_INTERVAL_SECONDS > 0:
+            self._audit_task = asyncio.create_task(self._audit_loop())
+            log.info(f"Self-audit enabled — every {SELF_AUDIT_INTERVAL_SECONDS}s")
+            audit_line = f"║  Self-audit: every {SELF_AUDIT_INTERVAL_SECONDS}s{' ' * (29 - len(str(SELF_AUDIT_INTERVAL_SECONDS)))}║"
+        else:
+            audit_line = "║  Self-audit: disabled (set SELF_AUDIT_INTERVAL)  ║"
+
         log.info(f"Listening on {SOCKET_PATH}")
         print(f"""
 ╔══════════════════════════════════════════════════╗
@@ -326,6 +336,7 @@ class CellServer:
 ║  Socket:     {SOCKET_PATH:<34s}                      ║
 ║  Dashboards: http://localhost:3000               ║
 ║  Kafka UI:   http://localhost:8080               ║
+{audit_line}
 ║                                                  ║
 ║  Commands (in another terminal):                 ║
 ║    agentcell add -n <name> -d "<directive>"      ║
@@ -349,9 +360,46 @@ class CellServer:
         finally:
             await self.shutdown()
 
+    async def _audit_loop(self):
+        """Periodically trigger self-audit on all active cells."""
+        # Wait for initial settle time before first audit
+        await asyncio.sleep(min(SELF_AUDIT_INTERVAL_SECONDS, 120))
+
+        while True:
+            try:
+                for name, cell in list(self.orchestrator.cells.items()):
+                    try:
+                        summary = await cell.self_audit()
+                        if summary.get("skipped"):
+                            log.debug(f"Audit skipped for '{name}': {summary.get('reason')}")
+                        else:
+                            actions = summary.get("actions_applied", [])
+                            log.info(
+                                f"Audit complete for '{name}': "
+                                f"{summary.get('consumers_audited', 0)} consumers checked, "
+                                f"{len(actions)} action(s) applied"
+                            )
+                    except Exception as e:
+                        log.error(f"Audit failed for '{name}': {e}")
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.error(f"Audit loop error: {e}")
+
+            try:
+                await asyncio.sleep(SELF_AUDIT_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                return
+
     async def shutdown(self):
         """Gracefully shut down all cells and the server."""
         log.info("Shutting down...")
+        if self._audit_task and not self._audit_task.done():
+            self._audit_task.cancel()
+            try:
+                await self._audit_task
+            except asyncio.CancelledError:
+                pass
         for name, cell in list(self.orchestrator.cells.items()):
             try:
                 log.info(f"Stopping cell '{name}' (state persisted)...")
