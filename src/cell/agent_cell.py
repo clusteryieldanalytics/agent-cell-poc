@@ -940,8 +940,8 @@ class AgentCell:
         runtime = action.get("runtime", old.spec.runtime)
         new_spec = ConsumerSpec(
             consumer_id=consumer_id,
-            source_topics=old.spec.source_topics,
-            output_topic=old.spec.output_topic,
+            source_topics=action.get("source_topics", old.spec.source_topics),
+            output_topic=action.get("output_topic", old.spec.output_topic),
             consumer_code=action.get("consumer_code", old.spec.consumer_code),
             description=action.get("description", old.spec.description),
             detection_patterns=action.get("detection_patterns", old.spec.detection_patterns),
