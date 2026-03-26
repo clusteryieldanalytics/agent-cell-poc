@@ -4,6 +4,15 @@
 ## Domain: Network monitoring, threat detection, traffic analysis
 ## Relevance: Demonstrates agentic data infrastructure for Auvik-style network observability
 
+## External Specs
+
+Feature specs and platform briefs live in `../specs/agent-cell-platform/`:
+
+- **`flink-integration-spec.md`** — Adds Apache Flink SQL as a second consumer runtime. The nucleus chooses python vs flink_sql per consumer. Flink handles windowed aggregations, joins, and CEP; Python handles knowledge-building. Composable pipeline pattern: Flink → derived topic → Python.
+- **`agent-cell-platform-brief.md`** — Platform-level brief for the agent cell architecture.
+
+When implementing a feature from these specs, read the full spec file first.
+
 ---
 
 ## Overview

@@ -12,6 +12,9 @@ from src.cell.knowledge import KnowledgeStore
 
 TOPIC_CATALOG = f"""Available Kafka source topics:
 
+All timestamps are in format 'YYYY-MM-DD HH:MM:SS.mmm' (no timezone suffix, already UTC).
+For Flink SQL, use: event_time AS TO_TIMESTAMP(`timestamp`) — no need for format strings.
+
 1. **{TOPIC_FLOWS}** — Network flow records (NetFlow/IPFIX style)
    Fields: timestamp, src_ip, dst_ip, src_port, dst_port, protocol, bytes_sent, bytes_received, packets, duration_ms, application, device_id, vlan_id, direction
    Volume: ~50 events/second
@@ -30,8 +33,9 @@ TOOLS = [
     {
         "name": "spawn_consumer",
         "description": (
-            "Spawn a Kafka consumer that runs your authored Python code to process events. "
-            "You author the complete processing logic, detection rules, and knowledge-building code.\n\n"
+            "Spawn a consumer using either the Python runtime or the Flink SQL runtime.\n\n"
+            "## Python runtime (default)\n"
+            "Author Python code with full access to the knowledge API.\n\n"
             "Your code must define:\n"
             "  process_event(event, state, knowledge) -> list[dict]\n"
             "    Called for every event. Returns alert dicts to emit, or [].\n\n"
@@ -48,30 +52,32 @@ TOOLS = [
             "    knowledge.store_embedding(content, category, metadata=None)\n"
             "                                        — Embed text using sentence-transformers (all-MiniLM-L6-v2, 384-dim)\n"
             "                                          and store in pgvector with HNSW index. Auto-chunks long text.\n"
-            "                                          Use for: attack pattern signatures, anomaly descriptions,\n"
-            "                                          device profiles, incident summaries — anything you want to\n"
-            "                                          retrieve later by semantic similarity.\n"
             "                                          Categories: 'attack_pattern', 'ip_reputation', 'baseline',\n"
             "                                          'device_profile', 'anomaly_rule', 'observation'\n"
             "    knowledge.search(query, limit=5)     — Semantic similarity search over stored embeddings.\n"
-            "                                          Finds entries with similar MEANING, not just keyword match.\n"
-            "                                          e.g., search('lateral movement') finds 'cross-VLAN SSH attempts'\n"
-            "    knowledge.hybrid_search(query, limit=5, keyword=None)\n"
-            "                                        — Best of both: vector similarity + full-text keyword search\n"
-            "                                          merged via Reciprocal Rank Fusion. Use keyword param for\n"
-            "                                          exact matches (IPs, device names) combined with semantic.\n"
-            "    knowledge.fts_search(query, limit=5)  — Pure keyword search over stored knowledge text\n"
+            "    knowledge.hybrid_search(query, limit=5, keyword=None) — Vector + full-text via RRF\n"
+            "    knowledge.fts_search(query, limit=5)  — Pure keyword search\n"
             "    knowledge.get(key) -> dict|None      — Get persistent key-value entry\n"
             "    knowledge.set(key, value_dict)       — Set persistent key-value entry\n\n"
             "Available in scope: time, datetime, timezone, defaultdict, math, re, json.\n\n"
-            "Example:\n"
+            "## Flink SQL runtime\n"
+            "Author Flink SQL for high-throughput stream processing. Runs as a Flink job.\n"
+            "Flink SQL consumers CANNOT use the knowledge API — they read Kafka and write Kafka.\n\n"
+            "For pipelines needing both Flink processing AND knowledge-building, use a composable\n"
+            "pattern: Flink SQL consumer writes to a derived topic, then a Python consumer subscribes\n"
+            "to that topic and builds knowledge.\n\n"
+            "IMPORTANT: Flink runs inside Docker. Use 'kafka:29092' as bootstrap server in SQL.\n"
+            "Python consumers use 'localhost:9092' (they run on the host).\n\n"
+            "Flink SQL consumer_code must contain:\n"
+            "  1. CREATE TABLE for source(s) with Kafka connector\n"
+            "  2. CREATE TABLE for the sink with Kafka connector\n"
+            "  3. INSERT INTO ... SELECT ... (this starts the Flink job)\n\n"
+            "Example Python consumer:\n"
             "```python\n"
             "def init(state, knowledge):\n"
             "    knowledge.create_table('''\n"
             "        CREATE TABLE IF NOT EXISTS ip_scores (\n"
-            "            ip VARCHAR(45) PRIMARY KEY,\n"
-            "            score FLOAT DEFAULT 0,\n"
-            "            event_count INT DEFAULT 0\n"
+            "            ip VARCHAR(45) PRIMARY KEY, score FLOAT DEFAULT 0, event_count INT DEFAULT 0\n"
             "        )\n"
             "    ''')\n"
             "    state['window'] = defaultdict(list)\n\n"
@@ -85,11 +91,38 @@ TOOLS = [
             "        knowledge.execute(\n"
             "            'INSERT INTO ip_scores (ip, score, event_count) VALUES (%s, %s, %s) '\n"
             "            'ON CONFLICT (ip) DO UPDATE SET score = ip_scores.score + 1, event_count = %s',\n"
-            "            (src, 1.0, count, count)\n"
-            "        )\n"
+            "            (src, 1.0, count, count))\n"
             "        state['window'][src] = []\n"
             "        return [{'alert_type': 'high_rate', 'severity': 'high', 'src_ip': src, 'count': count}]\n"
             "    return []\n"
+            "```\n\n"
+            "Example Flink SQL consumer:\n"
+            "```sql\n"
+            "CREATE TABLE flow_source (\n"
+            "    src_ip STRING, dst_ip STRING, bytes_sent BIGINT, `timestamp` STRING,\n"
+            "    event_time AS TO_TIMESTAMP(`timestamp`),\n"
+            "    WATERMARK FOR event_time AS event_time - INTERVAL '5' SECONDS\n"
+            ") WITH (\n"
+            "    'connector' = 'kafka', 'topic' = 'network.flows',\n"
+            "    'properties.bootstrap.servers' = 'kafka:29092',\n"
+            "    'properties.group.id' = 'flink-flow-agg',\n"
+            "    'scan.startup.mode' = 'latest-offset',\n"
+            "    'format' = 'json', 'json.ignore-parse-errors' = 'true'\n"
+            ");\n\n"
+            "CREATE TABLE traffic_summary_sink (\n"
+            "    window_start TIMESTAMP(3), window_end TIMESTAMP(3),\n"
+            "    src_ip STRING, total_bytes BIGINT, flow_count BIGINT\n"
+            ") WITH (\n"
+            "    'connector' = 'kafka', 'topic' = 'traffic.summary',\n"
+            "    'properties.bootstrap.servers' = 'kafka:29092', 'format' = 'json'\n"
+            ");\n\n"
+            "INSERT INTO traffic_summary_sink\n"
+            "SELECT TUMBLE_START(event_time, INTERVAL '1' MINUTE),\n"
+            "       TUMBLE_END(event_time, INTERVAL '1' MINUTE),\n"
+            "       src_ip, SUM(bytes_sent), COUNT(*)\n"
+            "FROM flow_source\n"
+            "GROUP BY TUMBLE(event_time, INTERVAL '1' MINUTE), src_ip\n"
+            "HAVING COUNT(*) > 50;\n"
             "```"
         ),
         "input_schema": {
@@ -98,6 +131,15 @@ TOOLS = [
                 "consumer_id": {
                     "type": "string",
                     "description": "Unique identifier for this consumer",
+                },
+                "runtime": {
+                    "type": "string",
+                    "enum": ["python", "flink_sql"],
+                    "description": (
+                        "Which runtime to use.\n"
+                        "- 'python' (default): Full knowledge API, per-event Python logic, low-to-medium throughput\n"
+                        "- 'flink_sql': Windowed aggregations, cross-topic joins, MATCH_RECOGNIZE, high throughput. No knowledge API."
+                    ),
                 },
                 "source_topics": {
                     "type": "array",
@@ -115,27 +157,25 @@ TOOLS = [
                 "detection_patterns": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of specific patterns/threats this consumer detects (e.g., 'port scans', 'brute force SSH', 'data exfiltration').",
+                    "description": "List of specific patterns/threats this consumer detects.",
                 },
                 "knowledge_tables": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Names of Postgres tables this consumer creates and uses.",
+                    "description": "Names of Postgres tables this consumer creates and uses (Python runtime only).",
                 },
                 "consumer_code": {
                     "type": "string",
                     "description": (
-                        "Python source code defining process_event(event, state, knowledge) -> list[dict] "
-                        "and optionally init(state, knowledge). This code runs autonomously on every "
-                        "event. Use knowledge to create tables, store embeddings, and build persistent "
-                        "knowledge structures that evolve as you process data.\n\n"
-                        "IMPORTANT SQL type rules:\n"
-                        "- Use TIMESTAMPTZ for timestamps, not FLOAT/DOUBLE PRECISION\n"
-                        "- Use JSONB for structured data\n"
-                        "- The event 'timestamp' field is an ISO 8601 string — store as TIMESTAMPTZ\n"
-                        "- Always guard against missing fields: event.get('field', default)\n"
-                        "- Convert numeric strings with float() before inserting into FLOAT columns\n"
-                        "- Errors go to a per-consumer dead letter queue for debugging"
+                        "For runtime='python': Python source code defining process_event() and optionally init().\n"
+                        "For runtime='flink_sql': Flink SQL with CREATE TABLE + INSERT INTO statements.\n\n"
+                        "Python SQL type rules:\n"
+                        "- Use TIMESTAMPTZ for timestamps, JSONB for structured data\n"
+                        "- Guard against missing fields: event.get('field', default)\n\n"
+                        "Flink SQL rules:\n"
+                        "- Use 'kafka:29092' as bootstrap server (Flink runs inside Docker)\n"
+                        "- Must include an INSERT INTO statement to start the job\n"
+                        "- Use watermarks for event-time processing"
                     ),
                 },
             },
@@ -275,7 +315,7 @@ CHAT_TOOLS = [
                 },
                 "consumer_code": {
                     "type": "string",
-                    "description": "The complete updated Python code with init() and process_event()",
+                    "description": "The complete updated code (Python or Flink SQL depending on consumer's runtime)",
                 },
             },
             "required": ["consumer_id", "description", "detection_patterns", "consumer_code"],
@@ -291,12 +331,13 @@ CHAT_TOOLS = [
             "type": "object",
             "properties": {
                 "consumer_id": {"type": "string"},
+                "runtime": {"type": "string", "enum": ["python", "flink_sql"], "description": "Runtime: 'python' (default) or 'flink_sql'"},
                 "source_topics": {"type": "array", "items": {"type": "string"}},
                 "output_topic": {"type": "string"},
                 "description": {"type": "string", "description": "Human-readable description of what this consumer does."},
                 "detection_patterns": {"type": "array", "items": {"type": "string"}, "description": "Patterns this consumer detects."},
-                "knowledge_tables": {"type": "array", "items": {"type": "string"}, "description": "Tables this consumer creates/uses."},
-                "consumer_code": {"type": "string"},
+                "knowledge_tables": {"type": "array", "items": {"type": "string"}, "description": "Tables this consumer creates/uses (Python only)."},
+                "consumer_code": {"type": "string", "description": "Python code or Flink SQL depending on runtime."},
             },
             "required": ["consumer_id", "source_topics", "output_topic", "description", "detection_patterns", "consumer_code"],
         },
@@ -375,6 +416,66 @@ CHAT_TOOLS = [
                     "default": 10,
                 },
             },
+        },
+    },
+    # --- Flink job management ---
+    {
+        "name": "flink_job_status",
+        "description": (
+            "Quick status check for one or all of my Flink SQL consumers. Returns job state "
+            "(RUNNING, FAILED, CANCELED, FINISHED), duration, and start time."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "consumer_id": {
+                    "type": "string",
+                    "description": "Consumer ID of a Flink SQL consumer. Omit to check all Flink consumers.",
+                },
+            },
+        },
+    },
+    {
+        "name": "flink_inspect",
+        "description": (
+            "Deep inspection of a Flink SQL job. Returns detailed vertex (operator) metrics — "
+            "records read/written, bytes in/out per operator, parallelism, and operator status. "
+            "If the job has failed, includes the root exception and stack traces. "
+            "Use this to diagnose throughput issues, understand data flow through operators, "
+            "or investigate why a Flink job failed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "consumer_id": {
+                    "type": "string",
+                    "description": "Consumer ID of the Flink SQL consumer to inspect",
+                },
+                "include": {
+                    "type": "string",
+                    "enum": ["details", "exceptions", "metrics", "all"],
+                    "description": (
+                        "What to include:\n"
+                        "- 'details': vertices/operators with per-operator metrics\n"
+                        "- 'exceptions': failure details and stack traces\n"
+                        "- 'metrics': aggregated throughput (total records/bytes in and out)\n"
+                        "- 'all': everything"
+                    ),
+                },
+            },
+            "required": ["consumer_id"],
+        },
+    },
+    {
+        "name": "flink_cluster",
+        "description": (
+            "Get Flink cluster overview — available task slots, running/failed/finished job counts, "
+            "number of task managers, and Flink version. Use this to check if the Flink cluster is "
+            "healthy and has capacity for new jobs."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
         },
     },
     # --- Visualization ---
@@ -619,7 +720,7 @@ MY CURRENT STATE:
 
 TOOLS:
 For initial provisioning:
-1. **spawn_consumer** — Author and deploy one of my Kafka consumers by writing its complete Python processing logic.
+1. **spawn_consumer** — Author and deploy a consumer using Python (knowledge-building) or Flink SQL (high-throughput stream processing).
 2. **store_knowledge** — Persist a design rationale or insight to my knowledge base.
 
 During interactive chat with the operator:
@@ -627,10 +728,13 @@ During interactive chat with the operator:
 4. **search_knowledge** — Hybrid semantic + full-text search over my embeddings.
 5. **describe_schema** — List all tables in my schema with their columns and types.
 6. **get_consumer_code** — Retrieve the actual Python source code of one of my consumers. ONLY use this when I need to modify the code or the operator explicitly asks to see it.
-7. **replace_consumer** — Hot-swap one of my consumer's code (requires operator approval).
-8. **spawn_consumer** — Add a new consumer (requires operator approval).
+7. **replace_consumer** — Hot-swap one of my consumer's code (requires operator approval). Works for both Python and Flink SQL consumers.
+8. **spawn_consumer** — Add a new consumer with Python or Flink SQL runtime (requires operator approval).
 9. **remove_consumer** — Remove one of my consumers (requires operator approval).
-10. **create_dashboard** — Create a live web dashboard at http://localhost:3000 with real-time charts/tables from my knowledge base.
+10. **flink_job_status** — Quick status check on my Flink SQL jobs (RUNNING, FAILED, etc.).
+11. **flink_inspect** — Deep inspection of a Flink job: per-operator metrics (records/bytes in/out), failure exceptions and stack traces, throughput aggregates.
+12. **flink_cluster** — Flink cluster overview: available slots, running/failed job counts, task managers.
+13. **create_dashboard** — Create a live web dashboard at http://localhost:3000 with real-time charts/tables from my knowledge base.
 
 ANSWERING QUESTIONS:
 - My CURRENT STATE above already contains each consumer's description, detection_patterns, knowledge_tables, and event stats.
@@ -677,11 +781,55 @@ When writing consumer code:
 - Handle edge cases (missing fields, type errors)
 - Build knowledge that improves my detection over time
 
-Available in your authored code: time, datetime, timezone, defaultdict, math, re, json."""
+Available in your authored code: time, datetime, timezone, defaultdict, math, re, json.
 
-    async def reason(self, trigger: str, context: str = "") -> list[dict]:
+CONSUMER ARCHITECTURE:
+Before designing my pipeline, I should weigh the tradeoffs of each design choice.
+Every consumer adds operational cost (monitoring, failure modes, Kafka topics), but
+splitting work across consumers also has real benefits (independent scaling, isolation,
+clarity of purpose). I should find the right balance for my specific directive.
+
+**Design approach:**
+1. Start by understanding what my directive requires — what data sources, what processing, what outputs.
+2. Consider the simplest design first: can one or two consumers cover everything?
+3. Add complexity only when it earns its keep — a concrete benefit that justifies the cost.
+4. Legitimate reasons to add consumers: different runtimes needed, independent failure domains,
+   fundamentally different processing patterns, or a consumer doing too many unrelated things.
+
+**When to use Flink SQL** (runtime="flink_sql"):
+- Windowed aggregations (TUMBLE, HOP, SESSION) — these are fragile and verbose in Python
+- Cross-topic joins within time windows — Flink handles this natively
+- Pattern detection via MATCH_RECOGNIZE (e.g., sequence detection)
+- High-throughput stateless transforms where parallelism matters
+- CANNOT access my knowledge API — reads Kafka, writes Kafka only
+- IMPORTANT: Use 'kafka:29092' as bootstrap server (Flink runs inside Docker)
+
+**When to use Python** (runtime="python"):
+- Knowledge-building: custom tables, vector embeddings, semantic search
+- Stateful per-event intelligence: scoring, anomaly detection, baseline comparison
+- Anything that needs the knowledge API
+- Simple detection logic that doesn't need windowed joins or aggregations
+
+**Composable pattern:**
+When a directive needs both Flink processing AND knowledge-building:
+  Flink SQL: pre-process raw topics → write to derived topic(s)
+  Python: subscribe to derived topic(s) → build knowledge, emit alerts
+
+**Judgment calls:**
+- A single Python consumer handling multiple topics is often the right call
+- But a directive covering multiple independent domains (e.g., threat detection AND device health)
+  may warrant separate consumers with clear ownership boundaries
+- Flink is the right tool when the processing genuinely benefits from it — don't avoid it
+  out of simplicity bias, and don't add it just because it's available
+- I should be able to articulate WHY each consumer exists in my plan"""
+
+    async def reason(self, trigger: str, context: str = "", single_spawn: bool = False) -> list[dict]:
         """Agentic reasoning loop. The nucleus can make multiple tool calls
-        across multiple turns until it signals it's done (end_turn)."""
+        across multiple turns until it signals it's done (end_turn).
+
+        If single_spawn=True, the loop exits after the first spawn_consumer
+        tool call, so consumers can be reviewed and deployed one at a time.
+        """
         self.event_log.clear()
         messages = [{"role": "user", "content": trigger}]
         all_decisions = []
@@ -695,7 +843,7 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
 
             response = await self._api_call_stream(
                 model=ANTHROPIC_MODEL,
-                max_tokens=8192,
+                max_tokens=16384,
                 system=self._system_prompt(context),
                 tools=TOOLS,
                 messages=messages,
@@ -764,12 +912,16 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
                         await self._log(f"Skipping auto-store for '{consumer_id}' — model already stored knowledge")
                         continue
                     inp = block.input
+                    runtime = inp.get("runtime", "python")
                     summary = (
-                        f"Consumer '{consumer_id}': {inp.get('description', 'no description')}. "
+                        f"Consumer '{consumer_id}' (runtime={runtime}): {inp.get('description', 'no description')}. "
                         f"Topics: {', '.join(inp.get('source_topics', []))} → {inp.get('output_topic', '?')}. "
-                        f"Detects: {', '.join(inp.get('detection_patterns', []))}. "
-                        f"Tables: {', '.join(inp.get('knowledge_tables', []))}."
+                        f"Detects: {', '.join(inp.get('detection_patterns', []))}."
                     )
+                    if runtime == "python":
+                        summary += f" Tables: {', '.join(inp.get('knowledge_tables', []))}."
+                    else:
+                        summary += " Runs as Flink SQL job in the Flink cluster."
                     reasoning = " ".join(text_parts).strip()
                     if reasoning:
                         summary += f" Rationale: {reasoning[:500]}"
@@ -782,19 +934,57 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
                     except Exception as e:
                         await self._log(f"Failed to auto-store knowledge: {e}")
 
-            # Feed back tool results so the model can continue
+            # In single_spawn mode, stop after the first spawn_consumer
+            if single_spawn and any(b.name == "spawn_consumer" for b in tool_uses):
+                await self._log("Single-spawn mode — stopping after first consumer proposal")
+                break
+
+            # Feed back tool results so the model knows what it already proposed
             messages.append({"role": "assistant", "content": response.content})
             tool_results = []
             for block in tool_uses:
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": f"OK — {block.name} accepted and will be executed.",
-                })
+                if block.name == "spawn_consumer":
+                    inp = block.input
+                    runtime = inp.get("runtime", "python")
+                    # Build a summary of all consumers proposed so far (including this one)
+                    proposed = [
+                        d for d in all_decisions
+                        if d.get("decision_type") == "spawn_consumer"
+                    ]
+                    proposed_summary = "\n".join(
+                        f"  - {d['action'].get('consumer_id', '?')} "
+                        f"(runtime={d['action'].get('runtime', 'python')}, "
+                        f"topics={d['action'].get('source_topics', [])!r} → "
+                        f"{d['action'].get('output_topic', '?')})"
+                        for d in proposed
+                    )
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": (
+                            f"OK — spawn_consumer '{inp.get('consumer_id', '?')}' "
+                            f"(runtime={runtime}) accepted and queued for deployment.\n\n"
+                            f"Consumers proposed so far:\n{proposed_summary}\n\n"
+                            f"Do NOT re-propose consumers you have already proposed. "
+                            f"If you need more consumers, propose only NEW ones with different IDs."
+                        ),
+                    })
+                else:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": f"OK — {block.name} accepted and will be executed.",
+                    })
             messages.append({"role": "user", "content": tool_results})
 
             if response.stop_reason == "end_turn":
                 break
+
+            if response.stop_reason == "max_tokens":
+                await self._log("Response truncated (max_tokens) — continuing...")
+                # Feed the truncated response back so the model can continue
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "user", "content": [{"type": "text", "text": "Your response was truncated. Continue from where you left off."}]})
 
         await self._log(f"Reasoning complete — {len(all_decisions)} decisions")
         self._log_to_kafka("reason_complete", {"decision_count": len(all_decisions)})
@@ -862,7 +1052,7 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
             return f"Error: {e}"
 
     # Side-effect tools that modify consumers
-    SIDE_EFFECT_TOOLS = {"get_consumer_code", "replace_consumer", "spawn_consumer", "remove_consumer", "create_dashboard", "inspect_dashboard", "update_dashboard_panel", "add_dashboard_panel", "inspect_dlq", "sample_topic", "topic_stats"}
+    SIDE_EFFECT_TOOLS = {"get_consumer_code", "replace_consumer", "spawn_consumer", "remove_consumer", "create_dashboard", "inspect_dashboard", "update_dashboard_panel", "add_dashboard_panel", "inspect_dlq", "flink_job_status", "flink_inspect", "flink_cluster", "sample_topic", "topic_stats"}
 
     async def chat(self, user_message: str, context: str = "", on_tool_action: callable = None) -> str:
         """Interactive chat with the operator.
@@ -895,7 +1085,7 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
 
             response = await self._api_call_stream(
                 model=ANTHROPIC_MODEL,
-                max_tokens=8192,
+                max_tokens=16384,
                 system=self._system_prompt(context),
                 tools=CHAT_TOOLS,
                 messages=working_messages,
@@ -916,6 +1106,13 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
             # Log assistant reasoning
             if text_parts:
                 self._log_to_kafka("assistant_text", {"text": " ".join(text_parts)})
+
+            # If truncated, continue the conversation
+            if response.stop_reason == "max_tokens":
+                await self._log("Response truncated (max_tokens) — continuing...")
+                working_messages.append({"role": "assistant", "content": response.content})
+                working_messages.append({"role": "user", "content": [{"type": "text", "text": "Your response was truncated. Continue from where you left off."}]})
+                continue
 
             # If no tool use, we're done
             if not has_tool_use:
@@ -978,7 +1175,7 @@ Available in your authored code: time, datetime, timezone, defaultdict, math, re
         working_messages.append({"role": "user", "content": [{"type": "text", "text": "Please summarize your findings and respond to the operator now. Do not call any more tools."}]})
         response = await self._api_call(
             model=ANTHROPIC_MODEL,
-            max_tokens=8192,
+            max_tokens=16384,
             system=self._system_prompt(context),
             messages=working_messages,
         )

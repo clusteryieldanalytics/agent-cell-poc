@@ -6,6 +6,7 @@ The server holds cells in memory with their consumers running as asyncio tasks.
 
 import asyncio
 import json
+import os
 import sys
 
 import typer
@@ -96,6 +97,78 @@ def _print_events(events: list[str]):
         _print_event(event)
 
 
+def _print_topology(consumers: list[dict], cell_name: str):
+    """Print a visual topology diagram of the consumer pipeline."""
+    if not consumers:
+        return
+
+    # Collect all source topics, intermediate topics, and output topics
+    source_topics = set()
+    output_topics = set()
+    consumer_outputs = {}  # consumer_id -> output_topic
+
+    for c in consumers:
+        for t in c.get("source_topics", []):
+            source_topics.add(t)
+        out = c.get("output_topic", "")
+        if out:
+            output_topics.add(out)
+            consumer_outputs[c["consumer_id"]] = out
+
+    # Intermediate topics: output of one consumer that's input to another
+    all_inputs = set()
+    for c in consumers:
+        all_inputs.update(c.get("source_topics", []))
+    intermediate = output_topics & all_inputs
+
+    # Build topology lines
+    lines = []
+    lines.append(f"[bold]Consumer Topology[/] — {cell_name}")
+    lines.append("")
+
+    # Group: Flink consumers first, then Python
+    flink = [c for c in consumers if c.get("runtime") == "flink_sql"]
+    python = [c for c in consumers if c.get("runtime", "python") != "flink_sql"]
+
+    def _format_consumer(c):
+        cid = c["consumer_id"]
+        runtime = c.get("runtime", "python")
+        inputs = ", ".join(c.get("source_topics", []))
+        output = c.get("output_topic", "?")
+        tag = "[magenta]Flink[/]" if runtime == "flink_sql" else "[blue]Python[/]"
+        return cid, tag, inputs, output
+
+    if flink:
+        lines.append("  [dim]── Data Processing Layer (Flink SQL) ──[/]")
+        for c in flink:
+            cid, tag, inputs, output = _format_consumer(c)
+            lines.append(f"    {inputs}")
+            lines.append(f"      └─→ {tag} [cyan]{cid}[/]")
+            if output in intermediate:
+                lines.append(f"            └─→ [yellow]{output}[/] [dim](derived)[/]")
+            else:
+                lines.append(f"            └─→ [green]{output}[/]")
+        lines.append("")
+
+    if python:
+        lines.append("  [dim]── Intelligence Layer (Python) ──[/]")
+        for c in python:
+            cid, tag, inputs, output = _format_consumer(c)
+            # Highlight if reading from a Flink-produced topic
+            input_parts = []
+            for t in c.get("source_topics", []):
+                if t in intermediate:
+                    input_parts.append(f"[yellow]{t}[/] [dim](from Flink)[/]")
+                else:
+                    input_parts.append(t)
+            lines.append(f"    {', '.join(input_parts)}")
+            lines.append(f"      └─→ {tag} [cyan]{cid}[/]")
+            lines.append(f"            └─→ [green]{output}[/] + [dim]pgvector knowledge[/]")
+        lines.append("")
+
+    console.print(Panel("\n".join(lines), border_style="dim"))
+
+
 def _run_verification(name: str, max_iterations: int = 5, settle_seconds: int = 15):
     """Run the self-verification loop, streaming events to the console."""
     console.print(f"\n[bold cyan]Verifying consumers (up to {max_iterations} iterations, {settle_seconds}s settle)...[/]\n")
@@ -151,10 +224,34 @@ def add(
     response = _send({"command": "init_cell", "name": name, "directive": directive}, stream=True)
     _check_error(response)
 
-    consumer_num = 0
+    # Architecture planning phase
+    console.print(f"\n[bold cyan]{'─' * 60}[/]")
+    console.print(f"[bold cyan]Planning consumer architecture...[/]\n")
+    response = _send({"command": "plan", "name": name}, stream=True)
+    _check_error(response)
 
-    # Iterative loop: propose one consumer at a time
-    while True:
+    plan = response.get("plan", "")
+    if plan:
+        from rich.markdown import Markdown
+        console.print(Panel(Markdown(plan), title="Architecture Plan", border_style="cyan"))
+        console.print()
+
+        if not auto_approve:
+            choice = Prompt.ask(
+                "  Proceed with this plan?",
+                choices=["y", "n"],
+                default="y",
+            )
+            if choice == "n":
+                console.print("[red]Aborted — cell initialized but no consumers deployed.[/]")
+                return
+
+    consumer_num = 0
+    max_proposals = 20  # safety cap to prevent infinite loops
+    consecutive_failures = 0
+
+    # Iterative loop: propose one consumer at a time, following the plan
+    while consumer_num < max_proposals:
         consumer_num += 1
         console.print(f"\n[bold cyan]{'─' * 60}[/]")
         console.print(f"[bold cyan]Proposing consumer #{consumer_num}...[/]\n")
@@ -184,7 +281,11 @@ def add(
         description = action.get("description", "")
         patterns = action.get("detection_patterns", [])
 
+        runtime = action.get("runtime", "python")
+        runtime_tag = "[magenta]flink_sql[/]" if runtime == "flink_sql" else "[blue]python[/]"
+
         console.print(f"  Consumer:  [bold cyan]{consumer_id}[/]")
+        console.print(f"  Runtime:   {runtime_tag}")
         console.print(f"  Topics:    {', '.join(topics)} → [green]{output}[/]")
         if description:
             console.print(f"  Purpose:   {description[:120]}")
@@ -195,7 +296,8 @@ def add(
         console.print()
 
         if code:
-            console.print(Syntax(code, "python", theme="monokai", line_numbers=True))
+            syntax_lang = "sql" if runtime == "flink_sql" else "python"
+            console.print(Syntax(code, syntax_lang, theme="monokai", line_numbers=True))
             console.print()
 
         # Approval gate
@@ -223,6 +325,25 @@ def add(
         console.print(f"\n  [cyan]Spawning '{consumer_id}'...[/]")
         response = _send({"command": "approve", "name": name, "approved": approved_indices})
         _check_error(response)
+
+        # Check if the consumer actually made it into the cell
+        cell_info = response.get("cell", {})
+        deployed_ids = {c.get("consumer_id") for c in cell_info.get("consumers", [])}
+        spawn_failures = response.get("spawn_failures", [])
+        if consumer_id not in deployed_ids:
+            consecutive_failures += 1
+            console.print(f"  [bold red]✗ Consumer '{consumer_id}' failed to deploy[/]")
+            for f in spawn_failures:
+                if f.get("consumer_id") == consumer_id or not spawn_failures:
+                    console.print(f"    [red]Runtime: {f.get('runtime', '?')}[/]")
+                    console.print(f"    [red]Error:   {f.get('error', 'unknown')}[/]")
+            if consecutive_failures >= 3:
+                console.print(f"\n[bold red]3 consecutive deploy failures — stopping provisioning.[/]")
+                console.print("[dim]Use 'agentcell chat' to debug and add consumers manually.[/]")
+                break
+            continue
+        else:
+            consecutive_failures = 0
 
         # Verify this consumer
         if verify:
@@ -302,9 +423,22 @@ def purge_all():
 
     results = response.get("results", [])
     for r in results:
-        console.print(f"  [red]✗[/] {r['name']}: {r.get('actions_count', 0)} resources deleted")
+        name = r.get("name", "?")
+        actions = r.get("actions", [])
+        error = r.get("error")
 
-    console.print(f"\n[bold red]All cells purged.[/]")
+        console.print(f"  [bold red]✗ {name}[/]")
+        if error:
+            console.print(f"    [red]Error: {error}[/]")
+        elif actions:
+            for action in actions:
+                console.print(f"    [dim]→[/] {action}")
+        else:
+            console.print(f"    [dim](no details)[/]")
+        console.print()
+
+    total_actions = sum(r.get("actions_count", 0) for r in results)
+    console.print(f"[bold red]All cells purged — {len(results)} cell(s), {total_actions} resource(s) removed.[/]")
 
 
 @app.command(name="list")
@@ -401,12 +535,28 @@ def chat(name: str = typer.Option(..., "--name", "-n")):
                 code = action.get("consumer_code", "")
 
                 if action_type in ("replace_consumer", "spawn_consumer"):
+                    runtime = action.get("runtime", "python")
+                    # Infer runtime from existing consumer if not in action (replace case)
+                    if action_type == "replace_consumer" and runtime == "python":
+                        # Check if the target consumer is actually flink_sql
+                        try:
+                            inspect_resp = _send({"command": "inspect", "name": name})
+                            for c in inspect_resp.get("cell", {}).get("consumers", []):
+                                if c.get("consumer_id") == consumer_id and c.get("runtime") == "flink_sql":
+                                    runtime = "flink_sql"
+                                    break
+                        except Exception:
+                            pass
+
+                    runtime_tag = "[magenta]flink_sql[/]" if runtime == "flink_sql" else "[blue]python[/]"
+                    syntax_lang = "sql" if runtime == "flink_sql" else "python"
+
                     console.print(f"\n{'─' * 60}")
-                    console.print(f"  [bold yellow]Proposed code change:[/] [cyan]{action_type}[/] → [cyan]{consumer_id}[/]")
+                    console.print(f"  [bold yellow]Proposed code change:[/] [cyan]{action_type}[/] → [cyan]{consumer_id}[/] ({runtime_tag})")
                     if action_type == "spawn_consumer":
                         console.print(f"  Topics: {', '.join(action.get('source_topics', []))} → {action.get('output_topic', '?')}")
                     console.print()
-                    console.print(Syntax(code, "python", theme="monokai", line_numbers=True))
+                    console.print(Syntax(code, syntax_lang, theme="monokai", line_numbers=True))
                     console.print()
 
                     choice = Prompt.ask(
@@ -422,6 +572,9 @@ def chat(name: str = typer.Option(..., "--name", "-n")):
                             console.print(f"  [red]✗ {result}[/]")
                         else:
                             console.print(f"  [green]✓ {result}[/]")
+                            # Run verification to confirm stability
+                            console.print()
+                            _run_verification(name, max_iterations=2, settle_seconds=10)
                     else:
                         console.print(f"  [red]✗ Skipped[/]")
                 elif action_type == "remove_consumer":
@@ -464,28 +617,75 @@ def inspect(name: str = typer.Option(..., "--name", "-n")):
     if info["consumers"]:
         table = Table(title="Consumers")
         table.add_column("ID", style="cyan")
+        table.add_column("Runtime", style="yellow")
         table.add_column("Description")
         table.add_column("Topics")
         table.add_column("Output", style="green")
         table.add_column("Detects")
-        table.add_column("Events", justify="right")
-        table.add_column("Alerts", justify="right")
+        table.add_column("In", justify="right")
+        table.add_column("Out", justify="right")
         table.add_column("Errors", justify="right")
-        table.add_column("Running")
+        table.add_column("Status")
         for c in info["consumers"]:
+            runtime = c.get("runtime", "python")
             patterns = c.get("detection_patterns", [])
+
+            # Status column: show Flink job state for flink_sql, running flag for python
+            if runtime == "flink_sql":
+                flink_state = c.get("flink_status", "")
+                if flink_state == "RUNNING":
+                    status_display = f"[green]RUNNING[/]"
+                elif flink_state in ("FAILED", "CANCELED"):
+                    status_display = f"[red]{flink_state}[/]"
+                elif flink_state == "UNREACHABLE":
+                    status_display = "[dim red]UNREACHABLE[/]"
+                elif flink_state:
+                    status_display = f"[yellow]{flink_state}[/]"
+                else:
+                    status_display = "[dim]?[/]"
+                # Append records if available
+                records_in = c.get("flink_records_in", 0)
+                records_out = c.get("flink_records_out", 0)
+                if records_in or records_out:
+                    status_display += f" [dim]({records_in}→{records_out})[/]"
+            else:
+                status_display = "[green]running[/]" if c["running"] else "[red]stopped[/]"
+
+            runtime_display = "[magenta]flink_sql[/]" if runtime == "flink_sql" else "[blue]python[/]"
+
+            # Events/Alerts columns: use Flink metrics for flink_sql consumers
+            if runtime == "flink_sql":
+                records_in = c.get("flink_records_in", 0)
+                records_out = c.get("flink_records_out", 0)
+                events_display = str(records_in) if records_in else "[dim]0[/]"
+                alerts_display = str(records_out) if records_out else "[dim]0[/]"
+            else:
+                events_display = str(c["events_processed"])
+                alerts_display = str(c.get("alerts_emitted", 0))
+
             table.add_row(
                 c["consumer_id"],
-                (c.get("description", "") or "")[:60] + ("..." if len(c.get("description", "") or "") > 60 else ""),
+                runtime_display,
+                (c.get("description", "") or "")[:50] + ("..." if len(c.get("description", "") or "") > 50 else ""),
                 ", ".join(c["source_topics"]),
                 c.get("output_topic", "-") or "-",
-                ", ".join(patterns[:3]) + (f" +{len(patterns)-3}" if len(patterns) > 3 else "") if patterns else "-",
-                str(c["events_processed"]),
-                str(c.get("alerts_emitted", 0)),
+                ", ".join(patterns[:2]) + (f" +{len(patterns)-2}" if len(patterns) > 2 else "") if patterns else "-",
+                events_display,
+                alerts_display,
                 str(c.get("errors", 0)),
-                "[green]yes[/]" if c["running"] else "[red]no[/]",
+                status_display,
             )
         console.print(table)
+
+        # Flink job IDs
+        flink_jobs = [c for c in info["consumers"] if c.get("flink_job_id")]
+        if flink_jobs:
+            for c in flink_jobs:
+                console.print(f"  [dim]Flink job:[/] [cyan]{c['consumer_id']}[/] → {c['flink_job_id']} [dim](http://localhost:8081)[/]")
+            console.print()
+
+        # Consumer topology diagram
+        _print_topology(info["consumers"], info["name"])
     else:
         console.print("[dim]No consumers spawned.[/]")
 
@@ -641,6 +841,7 @@ def decisions(
             "spawn_consumer": "bold green",
             "store_knowledge": "yellow",
             "replace_consumer": "bold yellow",
+            "self_audit": "bold magenta",
             "reasoning": "blue",
             "reason_start": "bold cyan",
             "reason_complete": "bold green",
@@ -668,6 +869,10 @@ def decisions(
             elif entry_type == "decision":
                 inner = d.get("decision_type", d.get("action", {}).get("type", "?"))
                 summary = f"{inner}: {d.get('reasoning', '')[:60]}"
+            elif entry_type == "self_audit":
+                action = d.get("action", {})
+                n_actions = len(action.get("actions_applied", []))
+                summary = f"{n_actions} fix(es) applied — {d.get('reasoning', '')[:60]}"
             elif entry_type in ("spawn_consumer", "store_knowledge", "reasoning"):
                 # Old format
                 action = d.get("action", {})
@@ -811,6 +1016,70 @@ def verify_cell(
 ):
     """Run self-verification on a cell's consumers. Checks DLQs and auto-fixes errors."""
     _run_verification(name, max_iterations, settle_seconds)
+
+
+@app.command()
+def audit(
+    name: str = typer.Option(..., "--name", "-n", help="Cell name"),
+):
+    """Trigger a self-audit on a cell. The nucleus reviews consumer health, DLQ errors,
+    and Flink job status, and autonomously fixes any issues it finds."""
+    console.print(f"\n[bold magenta]Triggering self-audit for '{name}'...[/]\n")
+    response = _send({"command": "audit", "name": name}, stream=True)
+    _check_error(response)
+
+    summary = response.get("summary", {})
+    if summary.get("skipped"):
+        console.print(f"[dim]Audit skipped: {summary.get('reason', '?')}[/]")
+        return
+
+    actions = summary.get("actions_applied", [])
+    consumers_checked = summary.get("consumers_audited", 0)
+
+    console.print(f"[bold]Audit complete[/] — {consumers_checked} consumer(s) checked, {len(actions)} fix(es) applied\n")
+
+    if actions:
+        for a in actions:
+            action_type = a.get("type", "?")
+            result = a.get("result", "")
+            if "Failed" in result or "error" in result.lower():
+                console.print(f"  [red]✗ {action_type}: {result}[/]")
+            else:
+                console.print(f"  [green]✓ {action_type}: {result}[/]")
+        console.print()
+
+    reply = summary.get("reply", "")
+    if reply:
+        console.print(Panel(reply[:500], title="Nucleus Assessment", border_style="magenta"))
+
+
+@app.command(name="audit-log")
+def audit_log(
+    follow: bool = typer.Option(True, "--follow/--no-follow", "-f", help="Follow the log (like tail -f)"),
+    lines: int = typer.Option(50, "--lines", "-n", help="Number of lines to show initially"),
+):
+    """Stream the autonomous audit log. Shows real-time nucleus activity during self-audit cycles."""
+    import subprocess
+    import sys
+
+    log_path = "/tmp/agentcell-audit.log"
+
+    if not os.path.exists(log_path):
+        console.print(f"[dim]No audit log yet at {log_path}[/]")
+        console.print("[dim]Enable self-audit with SELF_AUDIT_INTERVAL_SECONDS in .env, or run 'agentcell audit -n <name>'[/]")
+        return
+
+    console.print(f"[bold magenta]Streaming audit log[/] — {log_path}")
+    console.print("[dim]Press Ctrl+C to stop[/]\n")
+
+    try:
+        cmd = ["tail", f"-n{lines}"]
+        if follow:
+            cmd.append("-f")
+        cmd.append(log_path)
+        subprocess.run(cmd)
+    except KeyboardInterrupt:
+        pass
 
 
 @app.command()

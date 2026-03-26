@@ -25,6 +25,7 @@ from src.viz.dashboard import DashboardRegistry
 from src.viz.server import VizServer
 
 SOCKET_PATH = "/tmp/agentcell.sock"
+AUDIT_LOG_PATH = "/tmp/agentcell-audit.log"
 
 log = logging.getLogger("agentcell.server")
 
@@ -100,7 +101,8 @@ class CellServer:
             cell.nucleus.on_event = lambda msg: asyncio.ensure_future(send_event(msg if isinstance(msg, dict) else {"event": msg}))
             try:
                 await cell.initialize()
-                # Propose and approve consumers one at a time
+                # Plan architecture first, then propose and approve one at a time
+                await cell.plan_architecture()
                 while True:
                     decisions = await cell.propose_next()
                     has_consumer = any(d.get("decision_type") == "spawn_consumer" or d.get("action", {}).get("type") == "spawn_consumer" for d in decisions)
@@ -121,6 +123,16 @@ class CellServer:
                 cell.nucleus.on_event = None
             return {"ok": True, "cell_id": cell.cell_id, "name": cell.name}
 
+        elif command == "plan":
+            # Architecture planning phase
+            cell = self.orchestrator.get_cell(request["name"])
+            cell.nucleus.on_event = lambda msg: asyncio.ensure_future(send_event(msg if isinstance(msg, dict) else {"event": msg}))
+            try:
+                plan = await cell.plan_architecture()
+            finally:
+                cell.nucleus.on_event = None
+            return {"ok": True, "plan": plan}
+
         elif command == "propose_next":
             # Propose the next consumer
             cell = self.orchestrator.get_cell(request["name"])
@@ -137,9 +149,12 @@ class CellServer:
             approved_indices = request.get("approved", [])
             all_decisions = cell._pending_decisions
             approved = [all_decisions[i] for i in approved_indices if i < len(all_decisions)]
+            failures_before = len(cell._failed_spawns)
             await cell.approve(approved)
             cell._pending_decisions = []
-            return {"ok": True, "cell": cell.inspect()}
+            # Include any new spawn failures in the response
+            new_failures = cell._failed_spawns[failures_before:]
+            return {"ok": True, "cell": cell.inspect(), "spawn_failures": new_failures}
 
         elif command == "verify":
             cell = self.orchestrator.get_cell(request["name"])
@@ -152,6 +167,15 @@ class CellServer:
             finally:
                 cell.nucleus.on_event = None
             return {"ok": True, "summary": summary, "cell": cell.inspect()}
+
+        elif command == "audit":
+            cell = self.orchestrator.get_cell(request["name"])
+            cell.nucleus.on_event = lambda msg: asyncio.ensure_future(send_event(msg if isinstance(msg, dict) else {"event": msg}))
+            try:
+                summary = await cell.self_audit()
+            finally:
+                cell.nucleus.on_event = None
+            return {"ok": True, "summary": summary}
 
         elif command == "reject":
             name = request["name"]
@@ -236,7 +260,9 @@ class CellServer:
         elif command == "purge_all":
             results = await self.orchestrator.purge_all_cells()
             for r in results:
-                await send_event({"event": f"Purged {r['name']}: {r.get('actions_count', 0)} resources"})
+                await send_event({"event": f"Purging {r['name']}..."})
+                for action in r.get("actions", []):
+                    await send_event({"event": f"  → {action}"})
             return {"ok": True, "results": results}
 
         elif command == "dlq":
@@ -360,6 +386,73 @@ class CellServer:
         finally:
             await self.shutdown()
 
+    def _write_audit_log(self, cell_name: str, line: str):
+        """Append a line to the audit log file."""
+        try:
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            with open(AUDIT_LOG_PATH, "a") as f:
+                f.write(f"[{ts}] [{cell_name}] {line}\n")
+        except Exception:
+            pass
+
+    def _init_audit_text_buffer(self):
+        """Initialize the text delta accumulator for audit logging."""
+        self._audit_text_buf = ""
+
+    def _flush_audit_text_buffer(self, cell_name: str):
+        """Flush accumulated reasoning text to the audit log as clean lines."""
+        if hasattr(self, "_audit_text_buf") and self._audit_text_buf.strip():
+            for line in self._audit_text_buf.strip().split("\n"):
+                line = line.strip()
+                if line:
+                    self._write_audit_log(cell_name, f"  ▸ {line}")
+            self._audit_text_buf = ""
+
+    def _audit_event_handler(self, cell_name: str, msg):
+        """Handle nucleus events for the audit log.
+
+        Text deltas are accumulated into complete lines. Event log strings
+        are written immediately (after flushing any pending text).
+        """
+        if isinstance(msg, dict):
+            if msg.get("type") == "text_delta":
+                # Accumulate streaming text into a buffer
+                self._audit_text_buf += msg.get("text", "")
+                return
+        elif isinstance(msg, str):
+            text = msg.strip()
+            if not text:
+                return
+            # Flush any pending reasoning text before writing the event
+            self._flush_audit_text_buffer(cell_name)
+            self._write_audit_log(cell_name, text)
+
+    def _write_audit_summary(self, cell_name: str, summary: dict):
+        """Write a clean structured audit summary to the log."""
+        actions = summary.get("actions_applied", [])
+        n_consumers = summary.get("consumers_audited", 0)
+
+        self._write_audit_log(cell_name, f"Consumers checked: {n_consumers}")
+
+        if actions:
+            self._write_audit_log(cell_name, f"Actions applied: {len(actions)}")
+            for a in actions:
+                action_type = a.get("type", "?")
+                consumer_id = a.get("consumer_id", "?")
+                result = a.get("result", "")
+                self._write_audit_log(cell_name, f"  {action_type} '{consumer_id}' → {result}")
+        else:
+            self._write_audit_log(cell_name, "No fixes needed — all consumers healthy")
+
+        # Log the nucleus's assessment (the reply text, cleaned up)
+        reply = summary.get("reply", "")
+        if reply:
+            # Write the reply as a clean block, not streaming chunks
+            for line in reply.strip().split("\n"):
+                line = line.strip()
+                if line:
+                    self._write_audit_log(cell_name, f"  {line}")
+
     async def _audit_loop(self):
         """Periodically trigger self-audit on all active cells."""
         # Wait for initial settle time before first audit
@@ -369,10 +462,22 @@ class CellServer:
             try:
                 for name, cell in list(self.orchestrator.cells.items()):
                     try:
+                        # Wire nucleus events to the audit log
+                        self._init_audit_text_buffer()
+                        cell.nucleus.on_event = lambda msg, n=name: self._audit_event_handler(n, msg)
+                        self._write_audit_log(name, "── Audit started ──")
+
                         summary = await cell.self_audit()
+
+                        # Flush any remaining reasoning text
+                        self._flush_audit_text_buffer(name)
+
                         if summary.get("skipped"):
+                            self._write_audit_log(name, f"Skipped: {summary.get('reason')}")
                             log.debug(f"Audit skipped for '{name}': {summary.get('reason')}")
                         else:
+                            self._write_audit_summary(name, summary)
+                            self._write_audit_log(name, "── Audit ended ──")
                             actions = summary.get("actions_applied", [])
                             log.info(
                                 f"Audit complete for '{name}': "
@@ -380,7 +485,10 @@ class CellServer:
                                 f"{len(actions)} action(s) applied"
                             )
                     except Exception as e:
+                        self._write_audit_log(name, f"ERROR: {e}")
                         log.error(f"Audit failed for '{name}': {e}")
+                    finally:
+                        cell.nucleus.on_event = None
             except asyncio.CancelledError:
                 return
             except Exception as e:

@@ -1,12 +1,12 @@
 """Consumer spawning and management for agent cells.
 
-The nucleus authors Python consumer code dynamically. This module provides
-the Kafka read/write scaffold and executes the authored code. The nucleus
-writes a `process_event(event, state, knowledge)` function that:
-- Processes each event
-- Maintains in-memory state via `state` dict
-- Builds persistent knowledge via the `knowledge` interface
-- Returns alert dicts to emit to the output topic
+Supports two runtimes:
+- **python**: The nucleus authors Python code that runs in-process via exec().
+  Has full access to the knowledge API (custom tables, embeddings, semantic search).
+- **flink_sql**: The nucleus authors Flink SQL that runs as a Flink job via the
+  Flink SQL Gateway. Handles windowed aggregations, joins, CEP. No knowledge API.
+
+The ConsumerManager dispatches to the appropriate runtime based on ConsumerSpec.runtime.
 """
 
 import asyncio
@@ -30,10 +30,11 @@ class ConsumerSpec:
     consumer_id: str
     source_topics: list[str]
     output_topic: str
-    consumer_code: str  # Python source authored by the nucleus
+    consumer_code: str  # Python source or Flink SQL authored by the nucleus
     description: str = ""  # Human-readable description of what this consumer does
     detection_patterns: list[str] = field(default_factory=list)  # What patterns it detects
     knowledge_tables: list[str] = field(default_factory=list)  # What tables it creates/uses
+    runtime: str = "python"  # "python" | "flink_sql"
 
 
 @dataclass
@@ -47,6 +48,7 @@ class ManagedConsumer:
     errors: int = 0
     dlq_topic: str = ""
     running: bool = False
+    flink_job_id: str | None = None
 
     def to_dict(self, include_code: bool = False) -> dict:
         d = {
@@ -56,12 +58,15 @@ class ManagedConsumer:
             "description": self.spec.description,
             "detection_patterns": self.spec.detection_patterns,
             "knowledge_tables": self.spec.knowledge_tables,
+            "runtime": self.spec.runtime,
             "events_processed": self.events_processed,
             "alerts_emitted": self.alerts_emitted,
             "errors": self.errors,
             "dlq_topic": self.dlq_topic,
             "running": self.running,
         }
+        if self.flink_job_id:
+            d["flink_job_id"] = self.flink_job_id
         if include_code:
             d["consumer_code"] = self.spec.consumer_code
         return d
@@ -170,7 +175,11 @@ def _compile_consumer_code(code: str) -> tuple[callable, callable]:
 
 
 class ConsumerManager:
-    """Manages dynamically authored consumers for a cell."""
+    """Manages dynamically authored consumers for a cell.
+
+    Dispatches to the appropriate runtime (Python or Flink SQL) based on
+    ConsumerSpec.runtime.
+    """
 
     def __init__(self, cell_id: str, cell_name: str, knowledge_store: KnowledgeStore):
         self.cell_id = cell_id
@@ -178,9 +187,23 @@ class ConsumerManager:
         self.knowledge_store = knowledge_store
         self.consumers: dict[str, ManagedConsumer] = {}
         self._generation: int = 0  # incremented on each spawn to avoid consumer group conflicts
+        self._flink_runtime = None  # lazy init
+
+    def _get_flink_runtime(self):
+        """Lazy-init the Flink runtime (avoids import/connection when not needed)."""
+        if self._flink_runtime is None:
+            from src.cell.flink_runtime import FlinkRuntime
+            self._flink_runtime = FlinkRuntime()
+        return self._flink_runtime
 
     def spawn(self, spec: ConsumerSpec) -> ManagedConsumer:
-        """Compile the authored code and spawn the consumer as an asyncio task."""
+        """Dispatch to the appropriate runtime based on spec.runtime."""
+        if spec.runtime == "flink_sql":
+            return self._spawn_flink(spec)
+        return self._spawn_python(spec)
+
+    def _spawn_python(self, spec: ConsumerSpec) -> ManagedConsumer:
+        """Compile the authored Python code and spawn as an asyncio task."""
         process_event, init_fn = _compile_consumer_code(spec.consumer_code)
 
         knowledge = ConsumerKnowledge(self.knowledge_store)
@@ -197,6 +220,16 @@ class ConsumerManager:
             self._run_consumer(managed, process_event, state, knowledge)
         )
         self.consumers[spec.consumer_id] = managed
+        return managed
+
+    def _spawn_flink(self, spec: ConsumerSpec) -> ManagedConsumer:
+        """Submit Flink SQL to the Flink cluster and track the job."""
+        self._ensure_topics(spec.output_topic)
+        flink = self._get_flink_runtime()
+        job_id = flink.submit(spec)
+        managed = ManagedConsumer(spec=spec, running=True, flink_job_id=job_id)
+        self.consumers[spec.consumer_id] = managed
+        print(f"  [{self.cell_id}] Flink job '{spec.consumer_id}' submitted → job_id={job_id}")
         return managed
 
     async def _run_consumer(
@@ -313,7 +346,13 @@ class ConsumerManager:
         if consumer_id in self.consumers:
             managed = self.consumers[consumer_id]
             managed.running = False
-            if managed.task:
+            if managed.flink_job_id:
+                try:
+                    flink = self._get_flink_runtime()
+                    flink.cancel(managed.flink_job_id)
+                except Exception as e:
+                    print(f"  [{self.cell_id}] Warning: could not cancel Flink job {managed.flink_job_id}: {e}")
+            elif managed.task:
                 managed.task.cancel()
 
     def stop_all(self):

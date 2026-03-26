@@ -54,7 +54,7 @@ def _normal_syslog() -> dict:
     )
 
     return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
         "device_id": device,
         "device_type": "firewall" if device in FIREWALL_DEVICES else "router",
         "severity": tpl["severity"],
@@ -71,7 +71,7 @@ def _normal_syslog() -> dict:
 def _anomaly_syslogs(anomaly) -> list[dict]:
     """Generate correlated syslog events for active anomalies."""
     events = []
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     p = anomaly.params
 
     if anomaly.anomaly_type == AnomalyType.PORT_SCAN:
