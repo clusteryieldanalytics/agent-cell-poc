@@ -287,10 +287,10 @@ CHAT_TOOLS = [
     {
         "name": "replace_consumer",
         "description": (
-            "Replace a running consumer's code with updated code. The old consumer is stopped "
-            "and a new one is spawned with the same ID, topics, and output topic but with your "
-            "new process_event/init code. Use this when the operator asks you to refine, tune, "
-            "or add detection capabilities to an existing consumer."
+            "Replace a running consumer. The old consumer is stopped and a new one is spawned "
+            "with the same ID. You can update the code, source topics, output topic, and metadata. "
+            "Use this when the operator asks you to refine, tune, or add detection capabilities, "
+            "or when you need to fix a wiring gap (e.g., subscribing to an additional topic)."
         ),
         "input_schema": {
             "type": "object",
@@ -298,6 +298,15 @@ CHAT_TOOLS = [
                 "consumer_id": {
                     "type": "string",
                     "description": "ID of the consumer to replace (see your current consumers in context)",
+                },
+                "source_topics": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Updated list of Kafka topics to subscribe to. Omit to keep existing topics.",
+                },
+                "output_topic": {
+                    "type": "string",
+                    "description": "Updated output topic. Omit to keep existing.",
                 },
                 "description": {
                     "type": "string",
