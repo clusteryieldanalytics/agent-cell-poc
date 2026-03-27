@@ -350,26 +350,35 @@ class CellServer:
         if SELF_AUDIT_INTERVAL_SECONDS > 0:
             self._audit_task = asyncio.create_task(self._audit_loop())
             log.info(f"Self-audit enabled — every {SELF_AUDIT_INTERVAL_SECONDS}s")
-            audit_line = f"║  Self-audit: every {SELF_AUDIT_INTERVAL_SECONDS}s{' ' * (29 - len(str(SELF_AUDIT_INTERVAL_SECONDS)))}║"
-        else:
-            audit_line = "║  Self-audit: disabled (set SELF_AUDIT_INTERVAL)  ║"
 
         log.info(f"Listening on {SOCKET_PATH}")
+
+        # Build the box with consistent 48-char inner width
+        W = 48
+        def _line(text=""):
+            return f"║  {text:<{W-4}}  ║" if text else f"║{' ' * W}║"
+
+        if SELF_AUDIT_INTERVAL_SECONDS > 0:
+            audit_text = f"Self-audit: every {SELF_AUDIT_INTERVAL_SECONDS}s"
+        else:
+            audit_text = "Self-audit: disabled (set SELF_AUDIT_INTERVAL)"
+
         print(f"""
-╔══════════════════════════════════════════════════╗
-║          Agent Cell Server Running               ║
-║                                                  ║
-║  Socket:     {SOCKET_PATH:<34s}                      ║
-║  Dashboards: http://localhost:3000               ║
-║  Kafka UI:   http://localhost:8080               ║
-{audit_line}
-║                                                  ║
-║  Commands (in another terminal):                 ║
-║    agentcell add -n <name> -d "<directive>"      ║
-║    agentcell list / inspect / chat / dashboards  ║
-║                                                  ║
-║  Press Ctrl+C to stop                            ║
-╚══════════════════════════════════════════════════╝
+{'═' * (W + 2)}
+{_line('Agent Cell Server Running'.center(W - 4))}
+{_line()}
+{_line(f'Socket:     {SOCKET_PATH}')}
+{_line('Dashboards: http://localhost:3000')}
+{_line('Kafka UI:   http://localhost:8080')}
+{_line('Flink:      http://localhost:8081')}
+{_line(audit_text)}
+{_line()}
+{_line('Commands (in another terminal):')}
+{_line('  agentcell add -n <name> -d "<directive>"')}
+{_line('  agentcell list / inspect / chat / audit')}
+{_line()}
+{_line('Press Ctrl+C to stop')}
+{'═' * (W + 2)}
 """)
 
         loop = asyncio.get_event_loop()

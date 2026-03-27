@@ -253,6 +253,33 @@ CHAT_TOOLS = [
         },
     },
     {
+        "name": "store_knowledge",
+        "description": (
+            "Store an insight, observation, or learned pattern in your persistent knowledge base as a "
+            "vector embedding. Use this during chat to remember important findings — threat patterns "
+            "you've identified, audit conclusions, operator instructions, or any insight you want to "
+            "retrieve later by semantic search. This is YOUR long-term memory."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The knowledge to store — will be embedded for semantic retrieval",
+                },
+                "category": {
+                    "type": "string",
+                    "enum": ["attack_pattern", "ip_reputation", "baseline", "device_profile", "anomaly_rule", "design_rationale", "observation", "audit_finding"],
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Optional structured metadata",
+                },
+            },
+            "required": ["content", "category"],
+        },
+    },
+    {
         "name": "describe_schema",
         "description": (
             "List all tables in your knowledge base schema with their columns and types. "
@@ -423,6 +450,30 @@ CHAT_TOOLS = [
                     "type": "integer",
                     "description": "Max DLQ entries to return",
                     "default": 10,
+                },
+            },
+        },
+    },
+    # --- Decision history ---
+    {
+        "name": "read_decisions",
+        "description": (
+            "Read your own decision log — the full history of actions you've taken, tool calls, "
+            "reasoning, audit results, and consumer changes. Use this to review what you did in "
+            "previous sessions, understand why a consumer was changed, or recall past audit findings. "
+            "Returns the most recent entries (newest last)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "last": {
+                    "type": "integer",
+                    "description": "Number of recent entries to return (default 20)",
+                    "default": 20,
+                },
+                "entry_type": {
+                    "type": "string",
+                    "description": "Filter by entry type (e.g., 'decision', 'self_audit', 'replace_consumer', 'tool_call'). Omit for all types.",
                 },
             },
         },
@@ -751,6 +802,26 @@ ANSWERING QUESTIONS:
 - Only use get_consumer_code when I need the actual implementation details (thresholds, logic, specific code) or when preparing to modify the code.
 - Use query_knowledge and describe_schema to look up data in my knowledge base when the operator asks about specific detections, IPs, or patterns.
 
+PROBABILITY AND CONFIDENCE:
+When presenting findings, I should clearly distinguish between what I observed and what I inferred,
+and attach calibrated probability estimates to my claims:
+
+- **Observation** (high confidence, ~95%+): "IP 10.0.3.17 generated 847 auth_failure events" — this is
+  raw data from my tables, verifiable.
+- **Detection** (medium-high, ~70-95%): "This matches a brute-force pattern" — I applied a threshold
+  or heuristic. State the threshold and how far the data exceeded it.
+- **Correlation** (medium, ~30-70%): "These signals may be part of the same campaign" — I'm linking
+  independent detections. State what evidence supports the link and what alternative explanations exist.
+- **Hypothesis** (low-medium, ~10-40%): "The attacker likely compromised the AP first" — I'm
+  constructing a narrative. Explicitly flag this as a hypothesis and provide the probability.
+
+For each significant finding, I should state:
+1. The raw evidence (what I actually measured)
+2. My interpretation (what I think it means)
+3. My confidence level (as a percentage or qualitative label)
+4. Alternative explanations (what else could cause this pattern)
+5. What additional data would raise or lower my confidence
+
 MODIFYING MY CONSUMERS:
 1. First explain my PLAN — what I intend to change and why.
 2. Wait for the operator to confirm the plan (they may refine it).
@@ -764,10 +835,22 @@ designing a detection strategy), I MUST call **store_knowledge** to record:
 - The detection strategy and threshold choices for each consumer
 - How my consumers relate to each other and to my directive
 
-The Kafka decision log is an automatic audit trail for external meta-analysis only — I cannot read it.
-My knowledge base is MY memory. If I don't store_knowledge, I will forget why I made a decision.
+RECALLING PAST DECISIONS:
+My knowledge base (search_knowledge, query_knowledge) is my primary memory — fast, semantic,
+and purpose-built. I should always search there first when recalling why I made a decision,
+what patterns I've observed, or what my architecture rationale was.
+
+If I can't find what I need in my knowledge base, I can fall back to **read_decisions** which
+reads my raw Kafka decision log — every tool call, API response, and reasoning trace. This is
+complete but verbose. Prefer knowledge base for insights, decision log for forensics.
+
 I should store_knowledge at least once per spawn_consumer call, summarizing the consumer's purpose
 and the reasoning behind its design.
+
+I should also store_knowledge liberally during chat and self-audit whenever I have an insight worth
+keeping — a pattern I've noticed in the data, a threshold that needs tuning, a correlation between
+signals, a hypothesis about an attacker's behavior, an operator preference. If I think "this is
+interesting" or "I should remember this," I should store it. Storage is cheap; forgetting is expensive.
 
 CONSUMER CODE CAPABILITIES:
 My authored consumer code has three capabilities:
@@ -1018,6 +1101,14 @@ When a directive needs both Flink processing AND knowledge-building:
                     return "No matching knowledge found."
                 return json.dumps(results, indent=2, default=str)
 
+            elif name == "store_knowledge":
+                self.knowledge.store(
+                    content=tool_input["content"],
+                    category=tool_input.get("category", "observation"),
+                    metadata=tool_input.get("metadata"),
+                )
+                return f"Stored knowledge entry (category: {tool_input.get('category', 'observation')})"
+
             elif name == "describe_schema":
                 table_filter = tool_input.get("table_name")
                 if table_filter:
@@ -1061,7 +1152,7 @@ When a directive needs both Flink processing AND knowledge-building:
             return f"Error: {e}"
 
     # Side-effect tools that modify consumers
-    SIDE_EFFECT_TOOLS = {"get_consumer_code", "replace_consumer", "spawn_consumer", "remove_consumer", "create_dashboard", "inspect_dashboard", "update_dashboard_panel", "add_dashboard_panel", "inspect_dlq", "flink_job_status", "flink_inspect", "flink_cluster", "sample_topic", "topic_stats"}
+    SIDE_EFFECT_TOOLS = {"get_consumer_code", "replace_consumer", "spawn_consumer", "remove_consumer", "create_dashboard", "inspect_dashboard", "update_dashboard_panel", "add_dashboard_panel", "inspect_dlq", "read_decisions", "flink_job_status", "flink_inspect", "flink_cluster", "sample_topic", "topic_stats"}
 
     async def chat(self, user_message: str, context: str = "", on_tool_action: callable = None) -> str:
         """Interactive chat with the operator.

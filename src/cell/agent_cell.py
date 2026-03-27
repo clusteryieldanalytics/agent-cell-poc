@@ -824,7 +824,14 @@ class AgentCell:
             "3. If it has low alert rates relative to events processed, consider whether thresholds need tuning\n"
             "4. If everything looks healthy, say so briefly\n\n"
             "Use inspect_dlq, get_consumer_code, and replace_consumer as needed. "
-            "Be conservative — only change code if there's a clear problem."
+            "Be conservative — only change code if there's a clear problem.\n\n"
+            "IMPORTANT: As you examine your data, use store_knowledge to record anything interesting:\n"
+            "- Patterns you notice (e.g., 'IP 10.0.1.45 appears in both exfil and lateral movement alerts')\n"
+            "- Threshold observations (e.g., 'baseline bytes_sent is averaging 50K, current threshold of 5MB may be too high')\n"
+            "- Correlations between consumers (e.g., 'brute force signals from Flink correlate with auth_failure spikes in syslog')\n"
+            "- Anomalies in topic throughput or consumer behavior\n"
+            "- Any hypothesis about attacker behavior or network state\n"
+            "Use query_knowledge and sample_topic to dig into your data — don't just check health, learn from it."
         )
 
         print(f"[{self.name}] Starting self-audit...")
@@ -1219,6 +1226,40 @@ class AgentCell:
                 return json.dumps(overview, indent=2, default=str)
             except Exception as e:
                 return f"Error reaching Flink cluster: {e}"
+        elif tool_name == "read_decisions":
+            last = tool_input.get("last", 20)
+            entry_type_filter = tool_input.get("entry_type")
+            from src.cell.consumer import ConsumerManager as CM
+            entries = await CM.read_dlq(self.decision_topic, limit=last * 3)  # over-read then filter
+            if entry_type_filter:
+                entries = [e for e in entries if e.get("entry_type") == entry_type_filter or e.get("decision_type") == entry_type_filter]
+            entries = entries[-last:]
+            if not entries:
+                return "No decision log entries found."
+            # Slim down entries for readability — drop large fields
+            slim = []
+            for e in entries:
+                s = {
+                    "timestamp": e.get("timestamp", "")[:19],
+                    "type": e.get("entry_type") or e.get("decision_type", "?"),
+                }
+                if e.get("reasoning"):
+                    s["reasoning"] = e["reasoning"][:200]
+                if e.get("action", {}).get("type"):
+                    s["action_type"] = e["action"]["type"]
+                    cid = e["action"].get("consumer_id")
+                    if cid:
+                        s["consumer_id"] = cid
+                if e.get("message"):
+                    s["message"] = e["message"][:100]
+                if e.get("reply"):
+                    s["reply"] = e["reply"][:100]
+                if e.get("tool"):
+                    s["tool"] = e["tool"]
+                if e.get("result"):
+                    s["result"] = str(e["result"])[:100]
+                slim.append(s)
+            return json.dumps(slim, indent=2, default=str)
         elif tool_name == "inspect_dlq":
             consumer_id = tool_input.get("consumer_id")
             limit = tool_input.get("limit", 10)
