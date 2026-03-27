@@ -968,6 +968,26 @@ ANSWERING QUESTIONS:
 - Only use get_consumer_code when I need the actual implementation details (thresholds, logic, specific code) or when preparing to modify the code.
 - Use query_knowledge and describe_schema to look up data in my knowledge base when the operator asks about specific detections, IPs, or patterns.
 
+AVOIDING REDUNDANT WORK:
+My conversation history is lost between chat sessions. My knowledge base and decision log
+are my persistent memory across sessions. Before running expensive queries:
+
+1. **Search knowledge first.** Call search_knowledge with the operator's question. If I
+   previously stored a finding, assessment, or analysis that answers the question, use it
+   — cite when it was stored and note whether the data may have changed since then.
+2. **Check decision log if needed.** Call read_decisions to see if I recently ran the same
+   analysis in an audit or previous session.
+3. **Re-query only what's changed.** If I have a stored finding from 30 minutes ago, I don't
+   need to rebuild the entire analysis. Query only the live data (current counts, new alerts)
+   and compare against my stored baseline.
+4. **Full fresh analysis** only when: the operator explicitly asks to re-analyze, my stored
+   finding is old (hours+), or the question covers something I've never analyzed.
+
+Within a single chat session, I should also check my conversation history for recent answers.
+
+The pattern: search_knowledge → "I analyzed this 20 minutes ago, here's what I found then" →
+query_knowledge for fresh counts → "since then, 3 new alerts and score increased from 7 to 9."
+
 PROBABILITY AND CONFIDENCE:
 When presenting findings, I should clearly distinguish between what I observed and what I inferred,
 and attach calibrated probability estimates to my claims:
@@ -1253,24 +1273,151 @@ When a directive needs both Flink processing AND knowledge-building:
         "call store_knowledge to remember it before responding to the operator.]"
     )
 
+    # Approximate token budget for tool results in a single chat turn
+    _MAX_RESULT_TOKENS = 4000  # ~16K chars of JSON
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough token estimate: ~4 chars per token for English/JSON."""
+        return len(text) // 4
+
+    @staticmethod
+    def _format_sql_result(sql: str, rows: list[tuple]) -> str:
+        """Format SQL results with source grounding.
+
+        Extracts table names from the SQL and formats results as structured,
+        citable entries with column headers inferred from the query.
+        """
+        from datetime import datetime as dt
+        import re
+
+        # Extract table name(s) from SQL
+        tables = re.findall(r'\bFROM\s+(\w+)', sql, re.IGNORECASE)
+        tables += re.findall(r'\bJOIN\s+(\w+)', sql, re.IGNORECASE)
+        source = ", ".join(dict.fromkeys(tables)) if tables else "query"
+
+        # Extract column aliases/names from SELECT
+        select_match = re.search(r'SELECT\s+(.*?)\s+FROM', sql, re.IGNORECASE | re.DOTALL)
+        col_names = []
+        if select_match:
+            select_clause = select_match.group(1)
+            for part in select_clause.split(","):
+                part = part.strip()
+                # Check for AS alias
+                alias_match = re.search(r'\bAS\s+(\w+)\s*$', part, re.IGNORECASE)
+                if alias_match:
+                    col_names.append(alias_match.group(1))
+                else:
+                    # Use last identifier (handles table.column)
+                    ident = re.findall(r'(\w+)\s*$', part)
+                    col_names.append(ident[-1] if ident else f"col{len(col_names)}")
+
+        timestamp = dt.now().strftime("%Y-%m-%d %H:%M:%S")
+        header = f"[Source: {source}, queried: {timestamp}, rows: {len(rows)}]"
+
+        if not col_names or len(col_names) != len(rows[0]) if rows else False:
+            # Fallback: generic column names
+            if rows:
+                col_names = [f"col{i}" for i in range(len(rows[0]))]
+
+        lines = [header]
+        for row in rows:
+            entry_parts = []
+            for i, val in enumerate(row):
+                col = col_names[i] if i < len(col_names) else f"col{i}"
+                entry_parts.append(f"  {col}: {val}")
+            lines.append("\n".join(entry_parts))
+
+        return "\n\n".join(lines)
+
+    @staticmethod
+    def _format_search_result(results: list[dict]) -> str:
+        """Format semantic/hybrid search results with source grounding."""
+        from datetime import datetime as dt
+        timestamp = dt.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        lines = [f"[Source: knowledge embeddings, searched: {timestamp}, results: {len(results)}]"]
+        for i, r in enumerate(results, 1):
+            similarity = r.get("similarity", r.get("rrf_score", 0))
+            created = ""
+            meta = r.get("metadata", {})
+            if isinstance(meta, dict):
+                created = meta.get("timestamp", meta.get("created_at", ""))
+            lines.append(
+                f"\n[Result {i}, category: {r.get('category', '?')}, "
+                f"similarity: {similarity:.3f}"
+                + (f", created: {created}" if created else "")
+                + f"]\n{r.get('content', '')}"
+            )
+
+        return "\n".join(lines)
+
+    def _truncate_to_budget(self, text: str, budget_tokens: int | None = None) -> str:
+        """Truncate text to fit within a token budget, adding a notice if truncated."""
+        budget = budget_tokens or self._MAX_RESULT_TOKENS
+        estimated = Nucleus._estimate_tokens(text)
+        if estimated <= budget:
+            return text
+
+        # Truncate to budget, leaving room for the notice
+        char_budget = (budget - 50) * 4  # 50 tokens for notice
+        truncated = text[:char_budget]
+        return truncated + f"\n\n[Truncated: showing ~{budget} of ~{estimated} tokens. Narrow your query for complete results.]"
+
     def _execute_chat_tool(self, name: str, tool_input: dict) -> str:
         """Execute a read-only chat tool and return the result as a string."""
         try:
             if name == "query_knowledge":
-                rows = self.knowledge.execute(tool_input["sql"])
+                sql = tool_input["sql"]
+                rows = self.knowledge.execute(sql)
                 if not rows:
                     return "No results."
-                return json.dumps([list(r) for r in rows], indent=2, default=str) + self._KNOWLEDGE_NUDGE
+                formatted = self._format_sql_result(sql, rows)
+                return self._truncate_to_budget(formatted) + self._KNOWLEDGE_NUDGE
 
             elif name == "search_knowledge":
-                results = self.knowledge.hybrid_search(
+                requested_limit = tool_input.get("limit", 5)
+                # Step 1: Retrieve broadly (4x the requested limit)
+                candidates = self.knowledge.hybrid_search(
                     query=tool_input["query"],
-                    limit=tool_input.get("limit", 5),
+                    limit=max(requested_limit * 4, 20),
                     keyword=tool_input.get("keyword"),
                 )
-                if not results:
+                if not candidates:
                     return "No matching knowledge found."
-                return json.dumps(results, indent=2, default=str)
+
+                # Step 2: Deduplicate by content prefix + timestamp
+                # If multiple entries cover the same topic, prefer the most recent
+                seen_topics = {}
+                for r in candidates:
+                    content_key = r.get("content", "")[:100]
+                    meta = r.get("metadata", {}) or {}
+                    created = meta.get("created_at", meta.get("timestamp", ""))
+                    if content_key in seen_topics:
+                        if created > seen_topics[content_key]["created"]:
+                            seen_topics[content_key] = {"result": r, "created": created}
+                    else:
+                        seen_topics[content_key] = {"result": r, "created": created}
+                deduped = [v["result"] for v in seen_topics.values()]
+
+                # Step 3: Re-rank with cross-encoder for more accurate relevance
+                if len(deduped) > 1:
+                    try:
+                        from src.embeddings import rerank
+                        docs = [r.get("content", "") for r in deduped]
+                        ranked = rerank(tool_input["query"], docs, top_k=requested_limit)
+                        results = [deduped[idx] for idx, score in ranked]
+                        # Attach cross-encoder score
+                        for i, (_, score) in enumerate(ranked):
+                            results[i]["relevance_score"] = round(score, 4)
+                    except Exception:
+                        # Fallback: use original ranking if re-ranker fails
+                        results = deduped[:requested_limit]
+                else:
+                    results = deduped[:requested_limit]
+
+                formatted = self._format_search_result(results)
+                return self._truncate_to_budget(formatted)
 
             elif name == "embed_text":
                 from src.embeddings import embed_one
@@ -1349,7 +1496,48 @@ When a directive needs both Flink processing AND knowledge-building:
         on_tool_action is called for side-effect tools and should return a result string.
         """
         self.event_log.clear()
-        self.conversation_history.append({"role": "user", "content": user_message})
+
+        # Pre-fetch: automatically search knowledge for prior findings relevant to the question.
+        # This gives the nucleus its stored context without requiring a tool call.
+        prior_knowledge = ""
+        try:
+            prior_results = self.knowledge.hybrid_search(
+                query=user_message, limit=3,
+            )
+            await self._log(f"Prior knowledge search: {len(prior_results)} results for '{user_message[:60]}...'")
+            if prior_results:
+                entries = []
+                for r in prior_results:
+                    sim = r.get("similarity", 0)
+                    rrf = r.get("rrf_score", 0)
+                    # Use similarity if available (0-1 scale), otherwise rrf_score (0-0.03 scale)
+                    relevant = sim > 0.25 or rrf > 0.015
+                    if relevant:
+                        meta = r.get("metadata", {}) or {}
+                        created = meta.get("created_at", meta.get("timestamp", ""))
+                        score_str = f"{sim:.2f}" if sim > 0 else f"rrf:{rrf:.4f}"
+                        entries.append(
+                            f"[category: {r.get('category', '?')}"
+                            + (f", stored: {created}" if created else "")
+                            + f", relevance: {score_str}]\n{r.get('content', '')}"
+                        )
+                if entries:
+                    await self._log(f"Injecting {len(entries)} prior knowledge entries into context")
+                    prior_knowledge = (
+                        "\n\nPRIOR KNOWLEDGE (automatically retrieved — these are findings I stored earlier "
+                        "that may be relevant to this question. Check if they answer the question before "
+                        "running new queries. Note the timestamps — if recent, reference them; if stale, "
+                        "re-query to get fresh data):\n\n"
+                        + "\n\n".join(entries)
+                    )
+                else:
+                    await self._log("Prior knowledge: results found but none above relevance threshold (0.3)")
+            else:
+                await self._log("Prior knowledge: no results found")
+        except Exception as e:
+            await self._log(f"Prior knowledge search failed: {e}")
+
+        self.conversation_history.append({"role": "user", "content": user_message})  # store original
 
         # Log user input
         self._log_to_kafka("chat_user_message", {"message": user_message})
@@ -1357,6 +1545,31 @@ When a directive needs both Flink processing AND knowledge-building:
         # Build a working message list separate from conversation_history
         # so failed tool loops don't pollute the persistent history
         working_messages = self.conversation_history[-20:]
+
+        # If we have prior knowledge, inject it as a user message + prefilled assistant
+        # acknowledgment. This steers the model to build on prior findings rather than
+        # re-querying from scratch.
+        if prior_knowledge:
+            # Replace the user message with the augmented version
+            if working_messages and working_messages[-1]["role"] == "user":
+                working_messages[-1] = {"role": "user", "content": user_message + prior_knowledge}
+            # Add a prefilled assistant turn that acknowledges the prior findings
+            working_messages.append({
+                "role": "assistant",
+                "content": (
+                    "I found relevant prior findings in my knowledge base. Let me review them "
+                    "before deciding whether I need to run new queries or can build on what I already know."
+                ),
+            })
+            # Add a user nudge to continue
+            working_messages.append({
+                "role": "user",
+                "content": (
+                    "Good — use those prior findings as your starting point. Only run new queries "
+                    "if the prior knowledge is stale, incomplete, or doesn't answer the question. "
+                    "If the prior findings are sufficient, synthesize your answer from them directly."
+                ),
+            })
 
         max_iterations = 20
         for turn in range(max_iterations):
@@ -1433,8 +1646,9 @@ When a directive needs both Flink processing AND knowledge-building:
                 if block.name in self.SIDE_EFFECT_TOOLS and on_tool_action:
                     result = await on_tool_action(block.name, block.input)
                     result = result or "Action completed"
-                    # Nudge for data-returning tools
+                    # Budget-aware truncation and nudge for data-returning tools
                     if block.name in DATA_TOOLS:
+                        result = self._truncate_to_budget(result)
                         result += self._KNOWLEDGE_NUDGE
                     await self._log(f"Tool result ← {block.name}: {result[:100]}...")
                 else:

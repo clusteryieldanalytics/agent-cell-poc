@@ -182,7 +182,12 @@ class KnowledgeStore:
         with psycopg.connect(POSTGRES_URL) as conn:
             register_vector(conn)
             conn.execute(f"SET search_path TO {self.schema}, public")
-            result = conn.execute(sql, params)
+            if params:
+                result = conn.execute(sql, params)
+            else:
+                # No params — escape % so psycopg doesn't interpret them as placeholders.
+                # This lets the nucleus write raw SQL with LIKE '%pattern%' and vector literals.
+                result = conn.execute(sql.replace("%", "%%"))
             rows = result.fetchall() if result.description else []
             conn.commit()
             return rows

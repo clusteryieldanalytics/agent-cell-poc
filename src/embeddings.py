@@ -1,21 +1,29 @@
-"""Embedding module using sentence-transformers.
+"""Embedding and re-ranking module using sentence-transformers.
 
-Uses all-MiniLM-L6-v2 (384-dim, L2-normalized) for semantic similarity.
-Model is loaded lazily and cached for the process lifetime.
+Bi-encoder: all-MiniLM-L6-v2 (384-dim, L2-normalized) for fast similarity search.
+Cross-encoder: ms-marco-MiniLM-L-6-v2 for accurate re-ranking of search results.
+
+Both models are loaded lazily and cached for the process lifetime.
 """
 
 from functools import lru_cache
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 EMBEDDING_DIM = 384
 
 
 @lru_cache(maxsize=1)
 def _load_model() -> SentenceTransformer:
     return SentenceTransformer(MODEL_NAME)
+
+
+@lru_cache(maxsize=1)
+def _load_reranker() -> CrossEncoder:
+    return CrossEncoder(RERANKER_MODEL_NAME)
 
 
 def embed(texts: str | list[str]) -> np.ndarray:
@@ -29,6 +37,25 @@ def embed(texts: str | list[str]) -> np.ndarray:
 def embed_one(text: str) -> list[float]:
     """Embed a single text, return as list of floats."""
     return embed(text)[0].tolist()
+
+
+def rerank(query: str, documents: list[str], top_k: int | None = None) -> list[tuple[int, float]]:
+    """Re-rank documents against a query using a cross-encoder.
+
+    Returns list of (original_index, score) sorted by score descending.
+    Much more accurate than bi-encoder similarity for determining relevance,
+    but too expensive to run against the full corpus — use after initial retrieval.
+    """
+    if not documents:
+        return []
+    model = _load_reranker()
+    pairs = [(query, doc) for doc in documents]
+    scores = model.predict(pairs)
+    indexed = [(i, float(s)) for i, s in enumerate(scores)]
+    indexed.sort(key=lambda x: x[1], reverse=True)
+    if top_k:
+        indexed = indexed[:top_k]
+    return indexed
 
 
 def chunk_text(text: str, max_tokens: int = 250, overlap_tokens: int = 50) -> list[str]:
