@@ -22,6 +22,7 @@ class CellOrchestrator:
         cell_id = f"{name}-{uuid.uuid4().hex[:8]}"
         cell = AgentCell(cell_id=cell_id, name=name, directive=directive)
         cell.dashboard_registry = self.dashboard_registry
+        cell.orchestrator = self
         self.cells[name] = cell
         return cell
 
@@ -114,6 +115,7 @@ class CellOrchestrator:
 
             cell = AgentCell(cell_id=cell_id, name=name, directive=directive)
             cell.dashboard_registry = self.dashboard_registry
+            cell.orchestrator = self
             self.cells[name] = cell
             await cell.reload()
             reloaded += 1
