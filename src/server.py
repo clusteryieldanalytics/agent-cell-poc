@@ -215,6 +215,11 @@ class CellServer:
             await self.orchestrator.resume_cell(request["name"])
             return {"ok": True}
 
+        elif command == "check_topology":
+            cell = self.orchestrator.get_cell(request["name"])
+            analysis = cell.topology_analysis()
+            return {"ok": True, "analysis": analysis}
+
         elif command == "chat_status":
             cell = self.orchestrator.get_cell(request["name"])
             return {"ok": True, "info": {
