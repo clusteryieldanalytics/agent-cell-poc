@@ -46,8 +46,9 @@ class AgentCell:
         self.decision_topic = f"agent.decisions.{cell_id}"
         self._decision_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS})
 
-        # Dashboard registry (set by orchestrator after creation)
+        # Set by orchestrator after creation
         self.dashboard_registry = None
+        self.orchestrator = None  # reference to CellOrchestrator for cross-cell queries
 
         # Track failed spawns so propose_next doesn't re-propose them
         self._failed_spawns: list[dict] = []  # [{consumer_id, runtime, error}, ...]
@@ -1355,6 +1356,58 @@ class AgentCell:
         elif tool_name == "check_topology":
             analysis = self.topology_analysis()
             return json.dumps(analysis, indent=2, default=str)
+        elif tool_name == "list_cells":
+            if not self.orchestrator:
+                return "No orchestrator available — cannot list cells"
+            cells = []
+            for name, cell in self.orchestrator.cells.items():
+                cells.append({
+                    "name": name,
+                    "cell_id": cell.cell_id,
+                    "directive": cell.directive[:150],
+                    "status": cell.status.value,
+                    "consumers": len(cell.consumer_manager.consumers),
+                    "is_self": name == self.name,
+                })
+            return json.dumps(cells, indent=2, default=str)
+        elif tool_name == "search_cell_knowledge":
+            if not self.orchestrator:
+                return "No orchestrator available"
+            target_name = tool_input["cell_name"]
+            target = self.orchestrator.cells.get(target_name)
+            if not target:
+                return f"Cell '{target_name}' not found. Use list_cells to see available cells."
+            if target_name == self.name:
+                return "Use search_knowledge to search your own knowledge base."
+            try:
+                results = target.knowledge.hybrid_search(
+                    query=tool_input["query"],
+                    limit=tool_input.get("limit", 5),
+                )
+                if not results:
+                    return f"No matching knowledge found in '{target_name}'."
+                return json.dumps(results, indent=2, default=str)
+            except Exception as e:
+                return f"Error searching '{target_name}': {e}"
+        elif tool_name == "query_cell_knowledge":
+            if not self.orchestrator:
+                return "No orchestrator available"
+            target_name = tool_input["cell_name"]
+            target = self.orchestrator.cells.get(target_name)
+            if not target:
+                return f"Cell '{target_name}' not found. Use list_cells to see available cells."
+            if target_name == self.name:
+                return "Use query_knowledge to query your own knowledge base."
+            sql = tool_input.get("sql", "")
+            if not sql.strip().upper().startswith("SELECT"):
+                return "Only SELECT queries are allowed on other cells' knowledge bases."
+            try:
+                rows = target.knowledge.execute(sql)
+                if not rows:
+                    return "No results."
+                return json.dumps([list(r) for r in rows], indent=2, default=str)
+            except Exception as e:
+                return f"Error querying '{target_name}': {e}"
         elif tool_name == "read_decisions":
             last = tool_input.get("last", 20)
             entry_type_filter = tool_input.get("entry_type")

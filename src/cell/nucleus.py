@@ -471,6 +471,71 @@ CHAT_TOOLS = [
             "properties": {},
         },
     },
+    # --- Cross-cell collaboration ---
+    {
+        "name": "list_cells",
+        "description": (
+            "List all active agent cells in the system. Returns each cell's name, directive, "
+            "consumer count, and status. Use this to discover other cells whose knowledge "
+            "might be relevant to your analysis."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "search_cell_knowledge",
+        "description": (
+            "Search another cell's knowledge base by semantic similarity. Use this to cross-reference "
+            "your findings with observations from other cells. For example, if you detect a suspicious "
+            "IP, check if the traffic analysis cell has baseline data on it, or if the device health "
+            "cell has seen anomalies on related devices.\n\n"
+            "This is READ-ONLY — you cannot modify another cell's knowledge."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cell_name": {
+                    "type": "string",
+                    "description": "Name of the cell to search (from list_cells)",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Natural language search query",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results to return",
+                    "default": 5,
+                },
+            },
+            "required": ["cell_name", "query"],
+        },
+    },
+    {
+        "name": "query_cell_knowledge",
+        "description": (
+            "Run a SQL query against another cell's knowledge base tables. Use this for precise "
+            "cross-cell lookups — e.g., checking another cell's ip_reputation table for a specific IP, "
+            "or reading their alert_history for correlated events.\n\n"
+            "This is READ-ONLY — only SELECT queries are allowed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cell_name": {
+                    "type": "string",
+                    "description": "Name of the cell to query (from list_cells)",
+                },
+                "sql": {
+                    "type": "string",
+                    "description": "SQL SELECT query to run against the other cell's schema",
+                },
+            },
+            "required": ["cell_name", "sql"],
+        },
+    },
     # --- Decision history ---
     {
         "name": "read_decisions",
@@ -1211,7 +1276,7 @@ When a directive needs both Flink processing AND knowledge-building:
             return f"Error: {e}"
 
     # Side-effect tools that modify consumers
-    SIDE_EFFECT_TOOLS = {"get_consumer_code", "replace_consumer", "spawn_consumer", "remove_consumer", "create_dashboard", "inspect_dashboard", "update_dashboard_panel", "add_dashboard_panel", "inspect_dlq", "check_topology", "read_decisions", "flink_job_status", "flink_inspect", "flink_cluster", "flink_cleanup", "flink_scale", "sample_topic", "topic_stats"}
+    SIDE_EFFECT_TOOLS = {"get_consumer_code", "replace_consumer", "spawn_consumer", "remove_consumer", "create_dashboard", "inspect_dashboard", "update_dashboard_panel", "add_dashboard_panel", "inspect_dlq", "check_topology", "list_cells", "search_cell_knowledge", "query_cell_knowledge", "read_decisions", "flink_job_status", "flink_inspect", "flink_cluster", "flink_cleanup", "flink_scale", "sample_topic", "topic_stats"}
 
     async def chat(self, user_message: str, context: str = "", on_tool_action: callable = None) -> str:
         """Interactive chat with the operator.
