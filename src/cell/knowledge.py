@@ -176,12 +176,18 @@ class KnowledgeStore:
         scored.sort(key=lambda x: x["rrf_score"], reverse=True)
         return scored[:limit]
 
+
     def execute(self, sql: str, params: tuple = ()) -> list[tuple]:
         """Execute arbitrary SQL scoped to this cell's schema."""
         with psycopg.connect(POSTGRES_URL) as conn:
             register_vector(conn)
             conn.execute(f"SET search_path TO {self.schema}, public")
-            result = conn.execute(sql, params)
+            if params:
+                result = conn.execute(sql, params)
+            else:
+                # No params — escape % so psycopg doesn't interpret them as placeholders.
+                # This lets the nucleus write raw SQL with LIKE '%pattern%' and vector literals.
+                result = conn.execute(sql.replace("%", "%%"))
             rows = result.fetchall() if result.description else []
             conn.commit()
             return rows

@@ -1409,15 +1409,18 @@ class AgentCell:
             except Exception as e:
                 return f"Error querying '{target_name}': {e}"
         elif tool_name == "read_decisions":
-            last = tool_input.get("last", 20)
+            last = tool_input.get("last", 50)
             entry_type_filter = tool_input.get("entry_type")
             from src.cell.consumer import ConsumerManager as CM
-            entries = await CM.read_dlq(self.decision_topic, limit=last * 3)  # over-read then filter
+            # Read all entries from the topic (over-read, then filter and trim)
+            all_entries = await CM.read_dlq(self.decision_topic, limit=5000)
+            total_in_log = len(all_entries)
             if entry_type_filter:
-                entries = [e for e in entries if e.get("entry_type") == entry_type_filter or e.get("decision_type") == entry_type_filter]
-            entries = entries[-last:]
+                all_entries = [e for e in all_entries if e.get("entry_type") == entry_type_filter or e.get("decision_type") == entry_type_filter]
+            filtered_total = len(all_entries)
+            entries = all_entries[-last:]
             if not entries:
-                return "No decision log entries found."
+                return f"No decision log entries found (total in log: {total_in_log})."
             # Slim down entries for readability — drop large fields
             slim = []
             for e in entries:
@@ -1426,22 +1429,30 @@ class AgentCell:
                     "type": e.get("entry_type") or e.get("decision_type", "?"),
                 }
                 if e.get("reasoning"):
-                    s["reasoning"] = e["reasoning"][:200]
+                    s["reasoning"] = e["reasoning"][:300]
                 if e.get("action", {}).get("type"):
                     s["action_type"] = e["action"]["type"]
                     cid = e["action"].get("consumer_id")
                     if cid:
                         s["consumer_id"] = cid
                 if e.get("message"):
-                    s["message"] = e["message"][:100]
+                    s["message"] = e["message"][:150]
                 if e.get("reply"):
-                    s["reply"] = e["reply"][:100]
+                    s["reply"] = e["reply"][:150]
                 if e.get("tool"):
                     s["tool"] = e["tool"]
+                if e.get("input"):
+                    s["input"] = {k: v for k, v in e["input"].items() if k != "consumer_code"}
                 if e.get("result"):
-                    s["result"] = str(e["result"])[:100]
+                    s["result"] = str(e["result"])[:200]
                 slim.append(s)
-            return json.dumps(slim, indent=2, default=str)
+            header = (
+                f"Showing {len(entries)} of {filtered_total} entries"
+                + (f" (filtered by type='{entry_type_filter}')" if entry_type_filter else "")
+                + f" — {total_in_log} total entries in decision log."
+                + (f" Use last={filtered_total} to see all." if len(entries) < filtered_total else "")
+            )
+            return header + "\n" + json.dumps(slim, indent=2, default=str)
         elif tool_name == "inspect_dlq":
             consumer_id = tool_input.get("consumer_id")
             limit = tool_input.get("limit", 10)
