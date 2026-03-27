@@ -176,6 +176,137 @@ class KnowledgeStore:
         scored.sort(key=lambda x: x["rrf_score"], reverse=True)
         return scored[:limit]
 
+    def advanced_search(
+        self,
+        semantic_query: str | None = None,
+        keyword: str | None = None,
+        sql_filter: str | None = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        """Unified search combining vector similarity, full-text search, and SQL filtering.
+
+        All three modes are optional and composable:
+        - semantic_query: ranks results by vector cosine similarity (HNSW index)
+        - keyword: filters by full-text match on content (GIN index on content_tsv)
+        - sql_filter: arbitrary SQL WHERE clause, can JOIN/subquery against any table
+
+        At least one of semantic_query or keyword must be provided.
+
+        Scoring: when both semantic and FTS are used, results are scored by
+        Reciprocal Rank Fusion of both rankings. When only one is used, that
+        ranking is used directly. SQL filter is always applied as a hard filter.
+
+        The knowledge table is aliased as 'k'. Available columns:
+            k.id, k.content, k.category, k.metadata (JSONB), k.embedding, k.content_tsv
+        """
+        if not semantic_query and not keyword:
+            raise ValueError("At least one of semantic_query or keyword must be provided")
+
+        conditions = []
+        params = []
+
+        # Full-text search condition
+        if keyword:
+            safe_keyword = keyword.replace("%", "%%")
+            conditions.append(f"k.content_tsv @@ plainto_tsquery('english', '{safe_keyword}')")
+
+        # SQL filter condition
+        if sql_filter:
+            safe_filter = sql_filter.replace("%", "%%")
+            conditions.append(f"({safe_filter})")
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+        # Build scoring expression
+        if semantic_query and keyword:
+            # Both: use RRF-style scoring — run both and merge
+            vec = np.array(embed_one(semantic_query), dtype=np.float32)
+            sql = f"""
+                WITH vector_ranked AS (
+                    SELECT k.id, k.content, k.category, k.metadata,
+                           1 - (k.embedding <=> %s) AS similarity,
+                           ROW_NUMBER() OVER (ORDER BY k.embedding <=> %s) AS vec_rank
+                    FROM {self.schema}.knowledge k
+                    WHERE {where_clause}
+                    ORDER BY k.embedding <=> %s
+                    LIMIT %s
+                ),
+                fts_ranked AS (
+                    SELECT k.id,
+                           ts_rank(k.content_tsv, plainto_tsquery('english', %s)) AS fts_score,
+                           ROW_NUMBER() OVER (ORDER BY ts_rank(k.content_tsv, plainto_tsquery('english', %s)) DESC) AS fts_rank
+                    FROM {self.schema}.knowledge k
+                    WHERE {where_clause}
+                      AND k.content_tsv @@ plainto_tsquery('english', %s)
+                    LIMIT %s
+                )
+                SELECT v.content, v.category, v.metadata, v.similarity,
+                       COALESCE(f.fts_score, 0) AS fts_score,
+                       (1.0 / (60 + v.vec_rank) + 1.0 / (60 + COALESCE(f.fts_rank, %s))) AS rrf_score
+                FROM vector_ranked v
+                LEFT JOIN fts_ranked f ON v.id = f.id
+                ORDER BY rrf_score DESC
+                LIMIT %s
+            """
+            n_candidates = max(limit * 4, 20)
+            with psycopg.connect(POSTGRES_URL) as conn:
+                register_vector(conn)
+                conn.execute(f"SET search_path TO {self.schema}, public")
+                rows = conn.execute(sql, (
+                    vec, vec, vec, n_candidates,
+                    keyword, keyword, keyword, n_candidates,
+                    n_candidates,  # default fts_rank for non-matching
+                    limit,
+                )).fetchall()
+
+        elif semantic_query:
+            # Vector only (with optional SQL filter)
+            vec = np.array(embed_one(semantic_query), dtype=np.float32)
+            sql = f"""
+                SELECT k.content, k.category, k.metadata,
+                       1 - (k.embedding <=> %s) AS similarity,
+                       0.0 AS fts_score,
+                       0.0 AS rrf_score
+                FROM {self.schema}.knowledge k
+                WHERE {where_clause}
+                ORDER BY k.embedding <=> %s
+                LIMIT %s
+            """
+            with psycopg.connect(POSTGRES_URL) as conn:
+                register_vector(conn)
+                conn.execute(f"SET search_path TO {self.schema}, public")
+                rows = conn.execute(sql, (vec, vec, limit)).fetchall()
+
+        else:
+            # FTS only (with optional SQL filter)
+            sql = f"""
+                SELECT k.content, k.category, k.metadata,
+                       0.0 AS similarity,
+                       ts_rank(k.content_tsv, plainto_tsquery('english', %s)) AS fts_score,
+                       0.0 AS rrf_score
+                FROM {self.schema}.knowledge k
+                WHERE {where_clause}
+                  AND k.content_tsv @@ plainto_tsquery('english', %s)
+                ORDER BY fts_score DESC
+                LIMIT %s
+            """
+            with psycopg.connect(POSTGRES_URL) as conn:
+                register_vector(conn)
+                conn.execute(f"SET search_path TO {self.schema}, public")
+                rows = conn.execute(sql, (keyword, keyword, limit)).fetchall()
+
+        return [
+            {
+                "content": r[0],
+                "category": r[1],
+                "metadata": r[2],
+                "similarity": float(r[3]),
+                "fts_score": float(r[4]),
+                "rrf_score": float(r[5]),
+            }
+            for r in rows
+        ]
+
     def execute(self, sql: str, params: tuple = ()) -> list[tuple]:
         """Execute arbitrary SQL scoped to this cell's schema."""
         with psycopg.connect(POSTGRES_URL) as conn:

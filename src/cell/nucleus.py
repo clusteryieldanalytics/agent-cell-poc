@@ -210,9 +210,21 @@ CHAT_TOOLS = [
     {
         "name": "query_knowledge",
         "description": (
-            "Run a SQL query against your knowledge base to retrieve data your consumers have built. "
-            "Your schema contains tables created by your consumer code (e.g., ip_scores, traffic_baselines, "
-            "device_profiles) plus the built-in 'knowledge' and 'state' tables. Returns rows as a list of tuples."
+            "Run a SQL query against your knowledge base. You have full SQL access to all tables "
+            "in your schema — custom tables created by your consumers, plus the built-in 'knowledge' "
+            "and 'state' tables.\n\n"
+            "The 'knowledge' table has pgvector embeddings and tsvector full-text indexes:\n"
+            "  - id, content, embedding vector(384), category, metadata JSONB, content_tsv TSVECTOR\n\n"
+            "You can use pgvector operators in your SQL:\n"
+            "  - embedding <=> $vec  — cosine distance (lower = more similar)\n"
+            "  - 1 - (embedding <=> $vec)  — cosine similarity (higher = more similar)\n"
+            "  - ORDER BY embedding <=> $vec  — rank by semantic similarity\n\n"
+            "You can use full-text search operators:\n"
+            "  - content_tsv @@ plainto_tsquery('english', 'keyword')  — FTS match\n"
+            "  - ts_rank(content_tsv, query)  — FTS relevance score\n\n"
+            "To do vector searches, first call embed_text to get a vector, then use it in SQL.\n\n"
+            "Use describe_schema first to check table names and column types before querying.\n"
+            "Any consumer-created table that has a vector(384) column can also be searched by similarity."
         ),
         "input_schema": {
             "type": "object",
@@ -228,9 +240,10 @@ CHAT_TOOLS = [
     {
         "name": "search_knowledge",
         "description": (
-            "Search your knowledge base by meaning. Uses hybrid search (vector similarity + full-text) "
-            "merged via Reciprocal Rank Fusion for best results. Use this when the operator asks "
-            "conceptual questions about patterns, threats, or insights your consumers have observed."
+            "Quick semantic search over your knowledge table. Uses hybrid search (vector + full-text) "
+            "merged via Reciprocal Rank Fusion. Good for simple conceptual queries.\n\n"
+            "For complex queries that need SQL joins, full-text filtering on specific keywords, or "
+            "searches against consumer-created tables with embeddings, use embed_text + query_knowledge instead."
         ),
         "input_schema": {
             "type": "object",
@@ -250,6 +263,40 @@ CHAT_TOOLS = [
                 },
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "embed_text",
+        "description": (
+            "Convert text into a 384-dimensional vector embedding using sentence-transformers. "
+            "Returns the vector as a SQL-ready string like '[0.1, -0.3, ...]' that you can use "
+            "directly in pgvector queries via query_knowledge.\n\n"
+            "Use this to build your own vector similarity queries against ANY table that has a "
+            "vector(384) column — not just the knowledge table. Your consumers can create tables "
+            "with their own embedding columns, and you can search them the same way.\n\n"
+            "Typical workflow:\n"
+            "1. Call describe_schema to find tables with vector columns\n"
+            "2. Call embed_text to get a vector for your search query\n"
+            "3. Call query_knowledge with SQL that uses the vector:\n"
+            "   SELECT content, 1 - (embedding <=> '[...]') AS similarity\n"
+            "   FROM knowledge\n"
+            "   JOIN ip_threat_scores s ON s.src_ip = metadata->>'ip'\n"
+            "   WHERE s.threat_score > 5\n"
+            "     AND content_tsv @@ plainto_tsquery('english', 'brute force')\n"
+            "   ORDER BY embedding <=> '[...]'\n"
+            "   LIMIT 10\n\n"
+            "This gives you full control: vector similarity + full-text search + "
+            "arbitrary SQL joins in a single query."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The text to embed into a vector",
+                },
+            },
+            "required": ["text"],
         },
     },
     {
@@ -1224,6 +1271,20 @@ When a directive needs both Flink processing AND knowledge-building:
                 if not results:
                     return "No matching knowledge found."
                 return json.dumps(results, indent=2, default=str)
+
+            elif name == "embed_text":
+                from src.embeddings import embed_one
+                vec = embed_one(tool_input["text"])
+                # Return as a SQL-ready string: '[0.1, -0.3, ...]'
+                vec_str = "[" + ",".join(f"{v:.6f}" for v in vec) + "]"
+                return (
+                    f"Vector ({len(vec)} dimensions):\n{vec_str}\n\n"
+                    f"Use this in query_knowledge SQL like:\n"
+                    f"  SELECT content, 1 - (embedding <=> '{vec_str}') AS similarity\n"
+                    f"  FROM knowledge\n"
+                    f"  ORDER BY embedding <=> '{vec_str}'\n"
+                    f"  LIMIT 10"
+                )
 
             elif name == "store_knowledge":
                 self.knowledge.store(
