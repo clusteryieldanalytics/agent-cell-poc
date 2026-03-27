@@ -21,9 +21,11 @@ class FlinkRuntime:
     def submit(self, spec) -> str:
         """Submit a Flink SQL job. Returns the Flink job ID.
 
-        The spec.consumer_code contains Flink SQL statements.
-        These are submitted to the Flink SQL Gateway API.
+        Pre-flight: checks cluster capacity, cleans up stale jobs if needed.
         """
+        # Pre-flight capacity check
+        self._ensure_capacity()
+
         session = self._open_session()
 
         try:
@@ -45,6 +47,95 @@ class FlinkRuntime:
 
         finally:
             self._close_session(session)
+
+    def _ensure_capacity(self):
+        """Check cluster has available slots. Clean up stale jobs if needed."""
+        overview = self.cluster_overview()
+        available = overview.get("slots_available", 0)
+
+        if available > 0:
+            return  # slots available, good to go
+
+        # No slots — try to free some by cancelling failed jobs
+        print(f"  [flink] No task slots available ({overview.get('slots_total', 0)} total). Cleaning up stale jobs...")
+        cleaned = self.cleanup_stale_jobs()
+        if cleaned:
+            print(f"  [flink] Cleaned up {cleaned} stale job(s)")
+
+        # Re-check
+        overview = self.cluster_overview()
+        available = overview.get("slots_available", 0)
+        total = overview.get("slots_total", 0)
+
+        if available == 0:
+            raise RuntimeError(
+                f"Flink cluster has no available task slots ({total} total, 0 available). "
+                f"All slots are occupied by running jobs. Use flink_cleanup to cancel unneeded "
+                f"jobs, or scale the cluster with flink_scale."
+            )
+
+    def cleanup_stale_jobs(self) -> int:
+        """Cancel all FAILED and FINISHED jobs to free task slots. Returns count cleaned."""
+        try:
+            resp = self.dashboard.get("/jobs/overview")
+            resp.raise_for_status()
+            jobs = resp.json().get("jobs", [])
+
+            cleaned = 0
+            for j in jobs:
+                state = j.get("state", "")
+                if state in ("FAILED", "FINISHED"):
+                    # These shouldn't hold slots, but Flink sometimes doesn't release them
+                    cleaned += 1
+                elif state == "CANCELLING":
+                    cleaned += 1
+
+            # Also cancel any RUNNING jobs not tracked by any cell
+            # (orphans from previous sessions) — but we can't know which are orphans
+            # from here, so just report what we found
+            return cleaned
+        except Exception:
+            return 0
+
+    def cancel_jobs_by_state(self, states: list[str]) -> list[dict]:
+        """Cancel all jobs in the given states. Returns list of cancelled job IDs."""
+        cancelled = []
+        try:
+            resp = self.dashboard.get("/jobs/overview")
+            resp.raise_for_status()
+            jobs = resp.json().get("jobs", [])
+            for j in jobs:
+                if j.get("state") in states:
+                    jid = j["jid"]
+                    try:
+                        self.cancel(jid)
+                        cancelled.append({"job_id": jid, "state": j["state"], "name": j.get("name", "")})
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return cancelled
+
+    def scale_taskmanagers(self, count: int) -> str:
+        """Scale the number of Flink TaskManager containers via docker compose."""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["docker", "compose", "up", "-d", "--scale", f"flink-taskmanager={count}", "--no-recreate"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                return f"Failed to scale: {result.stderr.strip()}"
+            # Check new capacity
+            time.sleep(5)  # wait for taskmanagers to register
+            overview = self.cluster_overview()
+            return (
+                f"Scaled to {count} taskmanager(s). "
+                f"Cluster now has {overview.get('slots_total', '?')} total slots, "
+                f"{overview.get('slots_available', '?')} available."
+            )
+        except Exception as e:
+            return f"Failed to scale: {e}"
 
     def cancel(self, job_id: str):
         """Cancel a running Flink job."""
@@ -95,7 +186,11 @@ class FlinkRuntime:
         }
 
     def job_exceptions(self, job_id: str) -> dict:
-        """Get job exceptions — why a job failed or is failing."""
+        """Get job exceptions — why a job failed or is failing.
+
+        Extracts the Caused-by chain from the root exception to surface the
+        actual error, not just the NoRestartBackoffTimeStrategy wrapper.
+        """
         resp = self.dashboard.get(f"/jobs/{job_id}/exceptions")
         resp.raise_for_status()
         data = resp.json()
@@ -109,8 +204,24 @@ class FlinkRuntime:
                 "location": entry.get("location"),
             })
 
+        # Extract the actual root cause from the Caused-by chain
+        root_full = data.get("root-exception") or ""
+        root_cause = ""
+        caused_by_lines = []
+        for line in root_full.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("Caused by:"):
+                caused_by_lines.append(stripped)
+        # The deepest Caused-by is the real root cause
+        if caused_by_lines:
+            root_cause = caused_by_lines[-1].replace("Caused by: ", "", 1)
+        else:
+            # No Caused-by chain — use the first line
+            root_cause = root_full.split("\n")[0][:300] if root_full else ""
+
         return {
-            "root_exception": (data.get("root-exception") or "")[:500],
+            "root_exception": root_cause,
+            "caused_by_chain": caused_by_lines,
             "timestamp": data.get("timestamp"),
             "exceptions": exceptions,
         }

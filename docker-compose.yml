@@ -78,8 +78,8 @@ services:
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
-        taskmanager.numberOfTaskSlots: 4
-        taskmanager.memory.process.size: 1728m
+        taskmanager.numberOfTaskSlots: 8
+        taskmanager.memory.process.size: 2048m
     depends_on:
       - flink-jobmanager
 

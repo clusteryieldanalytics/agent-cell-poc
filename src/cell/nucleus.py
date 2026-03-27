@@ -454,6 +454,23 @@ CHAT_TOOLS = [
             },
         },
     },
+    # --- Topology analysis ---
+    {
+        "name": "check_topology",
+        "description": (
+            "Analyze your consumer pipeline topology for wiring issues. Returns:\n"
+            "- External source topics (Kafka sources not produced by any consumer)\n"
+            "- Intermediate topics (produced by one consumer, consumed by another)\n"
+            "- WARNINGS for: Flink outputs no consumer subscribes to, consumer inputs that "
+            "nothing produces to, multiple consumers writing to the same output topic.\n\n"
+            "Use this after deploying consumers to verify your pipeline is correctly wired, "
+            "or during audit to check for drift."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
     # --- Decision history ---
     {
         "name": "read_decisions",
@@ -536,6 +553,43 @@ CHAT_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {},
+        },
+    },
+    {
+        "name": "flink_cleanup",
+        "description": (
+            "Cancel stale Flink jobs (FAILED, FINISHED, or RUNNING orphans from previous sessions) "
+            "to free task slots. Use this when flink_cluster shows 0 available slots. "
+            "Specify which job states to cancel."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "states": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["FAILED", "FINISHED", "RUNNING", "CANCELLING"]},
+                    "description": "Job states to cancel. Start with ['FAILED', 'FINISHED'], add 'RUNNING' only if you're sure those jobs are orphans.",
+                },
+            },
+            "required": ["states"],
+        },
+    },
+    {
+        "name": "flink_scale",
+        "description": (
+            "Scale the number of Flink TaskManager containers to increase available task slots. "
+            "Each TaskManager provides 8 slots. Use this when the cluster is out of capacity and "
+            "cleanup isn't sufficient. Current default is 1 TaskManager (8 slots)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "taskmanager_count": {
+                    "type": "integer",
+                    "description": "Desired number of TaskManager containers (e.g., 2 for 16 slots)",
+                },
+            },
+            "required": ["taskmanager_count"],
         },
     },
     # --- Visualization ---
@@ -1082,6 +1136,11 @@ When a directive needs both Flink processing AND knowledge-building:
         self._log_to_kafka("reason_complete", {"decision_count": len(all_decisions)})
         return all_decisions
 
+    _KNOWLEDGE_NUDGE = (
+        "\n\n[Reminder: If you found anything interesting or surprising in this data, "
+        "call store_knowledge to remember it before responding to the operator.]"
+    )
+
     def _execute_chat_tool(self, name: str, tool_input: dict) -> str:
         """Execute a read-only chat tool and return the result as a string."""
         try:
@@ -1089,7 +1148,7 @@ When a directive needs both Flink processing AND knowledge-building:
                 rows = self.knowledge.execute(tool_input["sql"])
                 if not rows:
                     return "No results."
-                return json.dumps([list(r) for r in rows], indent=2, default=str)
+                return json.dumps([list(r) for r in rows], indent=2, default=str) + self._KNOWLEDGE_NUDGE
 
             elif name == "search_knowledge":
                 results = self.knowledge.hybrid_search(
@@ -1152,7 +1211,7 @@ When a directive needs both Flink processing AND knowledge-building:
             return f"Error: {e}"
 
     # Side-effect tools that modify consumers
-    SIDE_EFFECT_TOOLS = {"get_consumer_code", "replace_consumer", "spawn_consumer", "remove_consumer", "create_dashboard", "inspect_dashboard", "update_dashboard_panel", "add_dashboard_panel", "inspect_dlq", "read_decisions", "flink_job_status", "flink_inspect", "flink_cluster", "sample_topic", "topic_stats"}
+    SIDE_EFFECT_TOOLS = {"get_consumer_code", "replace_consumer", "spawn_consumer", "remove_consumer", "create_dashboard", "inspect_dashboard", "update_dashboard_panel", "add_dashboard_panel", "inspect_dlq", "check_topology", "read_decisions", "flink_job_status", "flink_inspect", "flink_cluster", "flink_cleanup", "flink_scale", "sample_topic", "topic_stats"}
 
     async def chat(self, user_message: str, context: str = "", on_tool_action: callable = None) -> str:
         """Interactive chat with the operator.
@@ -1241,10 +1300,17 @@ When a directive needs both Flink processing AND knowledge-building:
                     "input": tool_input_summary,
                 })
 
+                # Tools that return data the nucleus should consider storing
+                DATA_TOOLS = {"sample_topic", "topic_stats", "inspect_dlq", "read_decisions",
+                              "flink_job_status", "flink_inspect", "flink_cluster"}
+
                 if block.name in self.SIDE_EFFECT_TOOLS and on_tool_action:
                     result = await on_tool_action(block.name, block.input)
                     result = result or "Action completed"
-                    await self._log(f"Tool result ← {block.name}: {result}")
+                    # Nudge for data-returning tools
+                    if block.name in DATA_TOOLS:
+                        result += self._KNOWLEDGE_NUDGE
+                    await self._log(f"Tool result ← {block.name}: {result[:100]}...")
                 else:
                     result = self._execute_chat_tool(block.name, block.input)
                     if result is None:

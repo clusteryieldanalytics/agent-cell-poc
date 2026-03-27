@@ -360,6 +360,44 @@ def add(
         if verify:
             _run_verification(name, max_iterations, settle_seconds)
 
+    # Topology check
+    console.print(f"\n[bold cyan]Checking pipeline topology...[/]")
+    topo_resp = _send({"command": "check_topology", "name": name})
+    if topo_resp.get("ok"):
+        analysis = topo_resp.get("analysis", {})
+        warnings = analysis.get("warnings", [])
+        if warnings:
+            console.print(f"\n[bold yellow]Topology warnings ({len(warnings)}):[/]")
+            for w in warnings:
+                console.print(f"  [yellow]⚠ {w}[/]")
+            console.print()
+            console.print("[dim]The nucleus will be asked to fix these wiring issues.[/]")
+            # Ask the nucleus to fix topology issues via chat
+            fix_resp = _send(
+                {"command": "chat", "name": name, "message":
+                    f"TOPOLOGY CHECK found {len(warnings)} wiring issue(s) in your pipeline:\n\n"
+                    + "\n".join(f"- {w}" for w in warnings)
+                    + "\n\nUse check_topology to see full details, then fix the wiring issues "
+                    "using replace_consumer to update source_topics as needed."
+                },
+                stream=True,
+            )
+            if fix_resp.get("ok"):
+                pending = fix_resp.get("pending_actions", [])
+                for action in pending:
+                    action_type = action.get("type")
+                    consumer_id = action.get("consumer_id", "?")
+                    if action_type in ("replace_consumer", "spawn_consumer"):
+                        console.print(f"  [yellow]Proposed fix: {action_type} → {consumer_id}[/]")
+                        choice = Prompt.ask("  Deploy fix?", choices=["y", "n"], default="y")
+                        if choice == "y":
+                            deploy_resp = _send({"command": "deploy_action", "name": name, "action": action}, stream=True)
+                            result = deploy_resp.get("result", "")
+                            console.print(f"  [green]✓ {result}[/]")
+                console.print(f"\n{fix_resp.get('reply', '')}")
+        else:
+            console.print("[green]  ✓ Pipeline topology is clean — all topics wired correctly[/]")
+
     # Final summary
     info = _send({"command": "inspect", "name": name}).get("cell", {})
     console.print(Panel(
@@ -1061,7 +1099,7 @@ def audit(
 
     reply = summary.get("reply", "")
     if reply:
-        console.print(Panel(reply[:500], title="Nucleus Assessment", border_style="magenta"))
+        console.print(Panel(reply, title="Nucleus Assessment", border_style="magenta"))
 
 
 @app.command(name="audit-log")

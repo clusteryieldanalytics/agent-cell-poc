@@ -815,15 +815,30 @@ class AgentCell:
 
             consumer_health.append(health)
 
+        # Pre-compute topology analysis for the audit prompt
+        topo = self.topology_analysis()
+        topo_context = ""
+        if topo.get("warnings"):
+            topo_context = (
+                f"\n\nTOPOLOGY WARNINGS ({len(topo['warnings'])} issues found):\n"
+                + "\n".join(f"- {w}" for w in topo["warnings"])
+                + "\n\nFix these wiring issues using replace_consumer to update source_topics.\n"
+            )
+        else:
+            topo_context = "\n\nTopology check: CLEAN — all topics wired correctly.\n"
+
         audit_prompt = (
-            "SELF-AUDIT: Review your consumers' health and determine if any need tuning or fixes.\n\n"
-            f"Consumer health snapshot:\n{json.dumps(consumer_health, indent=2)}\n\n"
-            "For each consumer:\n"
-            "1. If it has DLQ errors, inspect the DLQ and fix the root cause\n"
-            "2. If it's not running, investigate why and respawn if needed\n"
-            "3. If it has low alert rates relative to events processed, consider whether thresholds need tuning\n"
-            "4. If everything looks healthy, say so briefly\n\n"
-            "Use inspect_dlq, get_consumer_code, and replace_consumer as needed. "
+            "SELF-AUDIT: Review your consumers' health, pipeline topology, and data quality.\n\n"
+            f"Consumer health snapshot:\n{json.dumps(consumer_health, indent=2)}\n"
+            f"{topo_context}\n"
+            "Audit steps:\n"
+            "1. If there are TOPOLOGY WARNINGS above, fix the wiring issues first (use replace_consumer to update source_topics)\n"
+            "2. If any consumer has DLQ errors, inspect the DLQ and fix the root cause\n"
+            "3. If a consumer is not running, investigate why and respawn if needed\n"
+            "4. If a consumer has low alert rates relative to events processed, consider whether thresholds need tuning\n"
+            "5. Call check_topology to verify your fixes resolved the wiring issues\n"
+            "6. If everything looks healthy, say so briefly\n\n"
+            "Use inspect_dlq, get_consumer_code, check_topology, and replace_consumer as needed. "
             "Be conservative — only change code if there's a clear problem.\n\n"
             "IMPORTANT: As you examine your data, use store_knowledge to record anything interesting:\n"
             "- Patterns you notice (e.g., 'IP 10.0.1.45 appears in both exfil and lateral movement alerts')\n"
@@ -855,8 +870,8 @@ class AgentCell:
         # Store the audit result in knowledge base
         try:
             self.knowledge.store(
-                f"Self-audit result: {reply[:500]}",
-                "design_rationale",
+                f"Self-audit result: {reply}",
+                "audit_finding",
                 {"audit": True, "actions_applied": len(actions_applied)},
             )
         except Exception:
@@ -866,7 +881,7 @@ class AgentCell:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "cell_id": self.cell_id,
             "decision_type": "self_audit",
-            "reasoning": reply[:500],
+            "reasoning": reply,
             "action": {"type": "self_audit", "actions_applied": actions_applied},
         })
 
@@ -919,6 +934,93 @@ class AgentCell:
             "events_processed": self.consumer_manager.total_events(),
             "knowledge_base": kb_stats,
             "decision_topic": self.decision_topic,
+        }
+
+    def topology_analysis(self) -> dict:
+        """Analyze the consumer pipeline topology for wiring issues.
+
+        Returns a dict with:
+        - consumers: list of consumer summaries
+        - external_sources: source topics not produced by any consumer
+        - intermediate_topics: output of one consumer consumed by another
+        - unwired_outputs: Flink outputs that no consumer subscribes to
+        - orphan_inputs: topics a consumer subscribes to that don't exist as
+          source topics or outputs of another consumer
+        - warnings: list of human-readable warning strings
+        """
+        consumers = self.consumer_manager.list_consumers()
+
+        output_to_consumer = {}
+        all_outputs = set()
+        all_inputs = set()
+
+        for c in consumers:
+            out = c.get("output_topic", "")
+            if out:
+                output_to_consumer[out] = c["consumer_id"]
+                all_outputs.add(out)
+            all_inputs.update(c.get("source_topics", []))
+
+        # Known external source topics (Kafka source topics from producers)
+        from src.config import TOPIC_FLOWS, TOPIC_DEVICE_STATUS, TOPIC_SYSLOG
+        known_sources = {TOPIC_FLOWS, TOPIC_DEVICE_STATUS, TOPIC_SYSLOG}
+
+        external_sources = all_inputs - all_outputs  # not produced by any consumer
+        intermediate = all_outputs & all_inputs  # produced and consumed
+        unwired_outputs = []
+        orphan_inputs = []
+        warnings = []
+
+        # Flink outputs not consumed by any consumer
+        for c in consumers:
+            if c.get("runtime") == "flink_sql":
+                out = c.get("output_topic", "")
+                if out and out not in all_inputs:
+                    unwired_outputs.append({
+                        "topic": out,
+                        "producer": c["consumer_id"],
+                        "issue": f"Flink consumer '{c['consumer_id']}' writes to '{out}' but no consumer subscribes to it",
+                    })
+                    warnings.append(
+                        f"UNWIRED: '{out}' produced by Flink consumer '{c['consumer_id']}' "
+                        f"but no consumer reads from it. Data is being written to Kafka but never processed."
+                    )
+
+        # Consumer inputs that aren't external sources or intermediate topics
+        for c in consumers:
+            for t in c.get("source_topics", []):
+                if t not in known_sources and t not in all_outputs:
+                    orphan_inputs.append({
+                        "topic": t,
+                        "consumer": c["consumer_id"],
+                        "issue": f"Consumer '{c['consumer_id']}' reads from '{t}' which is not a known source topic and not produced by any consumer",
+                    })
+                    warnings.append(
+                        f"ORPHAN INPUT: '{c['consumer_id']}' subscribes to '{t}' but nothing produces to it. "
+                        f"This consumer will never receive events on this topic."
+                    )
+
+        # Consumers with identical output topics (potential conflict)
+        output_writers = {}
+        for c in consumers:
+            out = c.get("output_topic", "")
+            if out:
+                output_writers.setdefault(out, []).append(c["consumer_id"])
+        for topic, writers in output_writers.items():
+            if len(writers) > 1:
+                warnings.append(
+                    f"SHARED OUTPUT: {len(writers)} consumers write to '{topic}': {', '.join(writers)}. "
+                    f"This is valid but may cause interleaved events."
+                )
+
+        return {
+            "consumer_count": len(consumers),
+            "external_sources": sorted(external_sources),
+            "intermediate_topics": sorted(intermediate),
+            "unwired_outputs": unwired_outputs,
+            "orphan_inputs": orphan_inputs,
+            "warnings": warnings,
+            "healthy": len(warnings) == 0,
         }
 
     # --- Consumer management (used by chat refinement) ---
@@ -1226,6 +1328,33 @@ class AgentCell:
                 return json.dumps(overview, indent=2, default=str)
             except Exception as e:
                 return f"Error reaching Flink cluster: {e}"
+        elif tool_name == "flink_cleanup":
+            try:
+                flink = self.consumer_manager._get_flink_runtime()
+                states = tool_input.get("states", ["FAILED", "FINISHED"])
+                cancelled = flink.cancel_jobs_by_state(states)
+                if not cancelled:
+                    return f"No jobs found in states {states}"
+                overview = flink.cluster_overview()
+                return (
+                    f"Cancelled {len(cancelled)} job(s): "
+                    + ", ".join(f"{c['job_id'][:8]}... ({c['state']})" for c in cancelled)
+                    + f"\nCluster now: {overview.get('slots_available', '?')} slots available "
+                    + f"of {overview.get('slots_total', '?')} total"
+                )
+            except Exception as e:
+                return f"Error during cleanup: {e}"
+        elif tool_name == "flink_scale":
+            try:
+                flink = self.consumer_manager._get_flink_runtime()
+                count = tool_input.get("taskmanager_count", 1)
+                result = flink.scale_taskmanagers(count)
+                return result
+            except Exception as e:
+                return f"Error scaling Flink: {e}"
+        elif tool_name == "check_topology":
+            analysis = self.topology_analysis()
+            return json.dumps(analysis, indent=2, default=str)
         elif tool_name == "read_decisions":
             last = tool_input.get("last", 20)
             entry_type_filter = tool_input.get("entry_type")
