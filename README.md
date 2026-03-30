@@ -37,14 +37,14 @@ The domain is **network security and observability**: synthetic producers genera
 └─────────────┘ └─────────────┘ └─────────────┘
        │               │               │
 ┌──────▼───────────────▼───────────────▼──────────────┐
-│                    Kafka Cluster                      │
-│  Source · Derived · Decision Logs · DLQs              │
+│                    Kafka Cluster                    │
+│  Source · Derived · Decision Logs · DLQs            │
 └──────────────────────┬──────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────┐
-│                 Apache Flink                          │
-│  JobManager · TaskManager · SQL Gateway              │
-│  Windowed aggregations · Joins · CEP                 │
+│                 Apache Flink                        │
+│  JobManager · TaskManager · SQL Gateway             │
+│  Windowed aggregations · Joins · CEP                │
 └─────────────────────────────────────────────────────┘
 ```
 
